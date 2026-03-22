@@ -55,7 +55,7 @@ def get_cosine_schedule(optimizer, warmup_steps: int, total_steps: int):
 
 
 def train_chord_predictor(args):
-    """Train the Chord Predictor model."""
+    """Train the decomposed Chord Predictor (root + quality heads)."""
     device = get_device()
     print(f"Device: {device}")
 
@@ -85,7 +85,7 @@ def train_chord_predictor(args):
             shuffle=False, collate_fn=collate_fn, num_workers=8, persistent_workers=True,
         )
 
-    # Model
+    # Model — decomposed into root (12) + quality (7) heads
     model = ChordPredictor(
         vocab_size=vocab.size,
         num_chord_classes=model_cfg["num_chord_classes"],
@@ -98,6 +98,7 @@ def train_chord_predictor(args):
     ).to(device)
 
     print(f"Chord Predictor: {model.get_num_params():,} parameters")
+    print(f"  Root classes: {model.num_roots}, Quality classes: {model.num_qualities}")
 
     # Optimizer and scheduler
     optimizer = torch.optim.AdamW(
@@ -108,10 +109,10 @@ def train_chord_predictor(args):
     total_steps = len(train_loader) * train_cfg["epochs"]
     scheduler = get_cosine_schedule(optimizer, train_cfg["warmup_steps"], total_steps)
 
-    # Loss
-    loss_fn = ChordPredictionLoss(
-        model_cfg["num_chord_classes"], train_cfg["label_smoothing"]
-    )
+    # Two losses — one per head
+    smoothing = train_cfg.get("label_smoothing", 0.1)
+    root_loss_fn = nn.CrossEntropyLoss(label_smoothing=smoothing)
+    quality_loss_fn = nn.CrossEntropyLoss(label_smoothing=smoothing)
 
     # Optional: wandb
     if args.wandb:
@@ -126,15 +127,19 @@ def train_chord_predictor(args):
     for epoch in range(train_cfg["epochs"]):
         model.train()
         total_loss = 0.0
-        total_acc = 0.0
+        total_root_acc = 0.0
+        total_qual_acc = 0.0
         num_batches = 0
 
         for batch in train_loader:
             melody = batch["melody_tokens"].to(device)
-            chord = batch["chord_label"].to(device)
+            root = batch["root_label"].to(device)
+            quality = batch["quality_label"].to(device)
 
-            logits = model(melody)
-            loss = loss_fn(logits, chord)
+            result = model(melody)
+            loss_root = root_loss_fn(result["root_logits"], root)
+            loss_qual = quality_loss_fn(result["quality_logits"], quality)
+            loss = loss_root + loss_qual
 
             optimizer.zero_grad()
             loss.backward()
@@ -143,57 +148,63 @@ def train_chord_predictor(args):
             scheduler.step()
 
             total_loss += loss.item()
-            total_acc += chord_accuracy(logits, chord, top_k=1)
+            total_root_acc += (result["root_logits"].argmax(-1) == root).float().mean().item()
+            total_qual_acc += (result["quality_logits"].argmax(-1) == quality).float().mean().item()
             num_batches += 1
 
         avg_loss = total_loss / num_batches
-        avg_acc = total_acc / num_batches
+        avg_root = total_root_acc / num_batches
+        avg_qual = total_qual_acc / num_batches
 
         # Validation
-        val_acc = 0.0
-        val_acc3 = 0.0
+        val_root = val_qual = 0.0
         if val_loader:
             model.eval()
-            val_total = 0
-            val_correct = 0
-            val_correct3 = 0
+            vr_sum = vq_sum = 0.0
+            v_total = 0
             with torch.no_grad():
                 for batch in val_loader:
                     melody = batch["melody_tokens"].to(device)
-                    chord = batch["chord_label"].to(device)
-                    logits = model(melody)
-                    val_correct += chord_accuracy(logits, chord, top_k=1)
-                    val_correct3 += chord_accuracy(logits, chord, top_k=3)
-                    val_total += 1
-            val_acc = val_correct / val_total
-            val_acc3 = val_correct3 / val_total
+                    root = batch["root_label"].to(device)
+                    quality = batch["quality_label"].to(device)
+                    result = model(melody)
+                    vr_sum += (result["root_logits"].argmax(-1) == root).float().mean().item()
+                    vq_sum += (result["quality_logits"].argmax(-1) == quality).float().mean().item()
+                    v_total += 1
+            val_root = vr_sum / v_total
+            val_qual = vq_sum / v_total
+
+        combined_val = val_root * val_qual  # Joint accuracy estimate
 
         print(
             f"Epoch {epoch+1}/{train_cfg['epochs']} | "
-            f"Loss: {avg_loss:.4f} | Train Acc: {avg_acc:.3f} | "
-            f"Val Acc@1: {val_acc:.3f} | Val Acc@3: {val_acc3:.3f} | "
+            f"Loss: {avg_loss:.4f} | "
+            f"Root: {avg_root:.3f}/{val_root:.3f} | "
+            f"Quality: {avg_qual:.3f}/{val_qual:.3f} | "
+            f"Combined: {combined_val:.3f} | "
             f"LR: {scheduler.get_last_lr()[0]:.2e}"
         )
 
         if args.wandb:
             wandb.log({
                 "chord/train_loss": avg_loss,
-                "chord/train_acc": avg_acc,
-                "chord/val_acc_top1": val_acc,
-                "chord/val_acc_top3": val_acc3,
+                "chord/train_root_acc": avg_root,
+                "chord/train_quality_acc": avg_qual,
+                "chord/val_root_acc": val_root,
+                "chord/val_quality_acc": val_qual,
+                "chord/val_combined": combined_val,
                 "chord/lr": scheduler.get_last_lr()[0],
             })
 
-        # Save best
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
+        # Save best (based on combined root * quality)
+        if combined_val > best_val_acc:
+            best_val_acc = combined_val
             torch.save(model.state_dict(), ckpt_dir / "chord_best.pt")
 
-        # Save periodic
         if (epoch + 1) % 5 == 0:
             torch.save(model.state_dict(), ckpt_dir / f"chord_epoch{epoch+1}.pt")
 
-    print(f"\nBest validation accuracy: {best_val_acc:.3f}")
+    print(f"\nBest combined val accuracy: {best_val_acc:.3f}")
     print(f"Best model saved to {ckpt_dir / 'chord_best.pt'}")
 
 
@@ -250,7 +261,7 @@ def train_texture_generator(args):
     # Texture generator
     model = TextureGenerator(
         vocab_size=vocab.size,
-        num_chord_classes=chord_cfg["num_chord_classes"],
+        num_chord_classes=84,  # 12 roots × 7 quality groups (decomposed)
         embed_dim=model_cfg["embed_dim"],
         num_layers=model_cfg["num_layers"],
         num_heads=model_cfg["num_heads"],
@@ -298,13 +309,17 @@ def train_texture_generator(args):
 
             # Get melody encoding from frozen chord predictor
             with torch.no_grad():
-                _, melody_context = chord_model(melody, return_embedding=True)
+                result, melody_context = chord_model(melody, return_embedding=True)
+                # Combine root + quality into a single chord ID for texture generator
+                pred_root = result["root_logits"].argmax(dim=-1)
+                pred_qual = result["quality_logits"].argmax(dim=-1)
+                chord_ids = pred_root * 7 + pred_qual  # 0..83
 
             # Forward through texture generator
             logits, _ = model(
                 accomp_tokens=accomp_in,
                 melody_context=melody_context,
-                chord_ids=chord,
+                chord_ids=chord_ids,
             )
 
             loss = loss_fn(logits, accomp_tgt) / accum_steps
@@ -334,8 +349,11 @@ def train_texture_generator(args):
                     accomp_in = batch["accomp_input"].to(device)
                     accomp_tgt = batch["accomp_target"].to(device)
 
-                    _, melody_context = chord_model(melody, return_embedding=True)
-                    logits, _ = model(accomp_in, melody_context, chord)
+                    result, melody_context = chord_model(melody, return_embedding=True)
+                    pred_root = result["root_logits"].argmax(dim=-1)
+                    pred_qual = result["quality_logits"].argmax(dim=-1)
+                    chord_ids = pred_root * 7 + pred_qual
+                    logits, _ = model(accomp_in, melody_context, chord_ids)
                     val_ppl_batch = token_perplexity(logits, accomp_tgt, vocab.pad_id)
                     val_loss_sum += val_ppl_batch
                     val_batches += 1
