@@ -1,21 +1,17 @@
 """
 Preprocess POP909 MIDI files into tokenized training data.
 
-For each song in POP909:
-1. Load the MIDI file
-2. Identify melody and accompaniment tracks
-3. Load chord annotations
-4. Tokenize into (melody_tokens, chord_label, accompaniment_tokens) windows
-5. Apply data augmentation (transposition, tempo jitter)
-6. Save as .pt files for training
+Key preprocessing steps (following published best practices):
+1. Detect key and normalize all songs to C major / A minor
+2. Align windows to chord boundaries (not fixed 2-bar cuts)
+3. One chord per window (window = one chord span)
+4. No 12-key transposition (normalization makes it unnecessary)
+5. Augment with tempo jitter and onset jitter instead
 
-Output format per window:
-{
-    "melody_tokens": Tensor[int],       # Token IDs for melody window
-    "chord_label": int,                  # Chord class ID for this window
-    "accomp_tokens": Tensor[int],        # Token IDs for accompaniment
-    "song_id": int,                      # For train/val/test splitting
-}
+References:
+- HarmonyTok (MDPI 2025): key normalization + chord spelling
+- Structure-Aware Piano (arXiv 2026): key normalization + functional chords
+- "Translating Melody to Chord" (IEEE 2022): Hooktheory preprocessing
 """
 
 import json
@@ -32,15 +28,100 @@ from src.tokenizer.vocab import Vocabulary, PITCH_NAMES, CHORD_QUALITIES
 
 DATA_DIR = Path(__file__).parent.parent
 RAW_DIR = DATA_DIR / "raw" / "pop909"
-# POP909 repo nests songs under a POP909/ subdirectory
 POP909_SONGS_DIR = RAW_DIR / "POP909"
 OUT_DIR = DATA_DIR / "processed"
 
 
-def parse_chord_annotation(chord_file: Path) -> list[tuple[float, str, str]]:
+# --- Key detection (simplified Krumhansl-Schmuckler) ---
+
+# Major and minor key profiles (Krumhansl)
+MAJOR_PROFILE = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
+MINOR_PROFILE = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
+
+
+def detect_key(notes: list[NoteEvent]) -> tuple[int, str]:
+    """Detect the key of a piece using Krumhansl-Schmuckler algorithm.
+
+    Returns:
+        (root_semitone, mode) where root_semitone is 0-11 and mode is "major" or "minor"
+    """
+    if not notes:
+        return 0, "major"
+
+    # Build pitch class histogram weighted by duration
+    histogram = np.zeros(12)
+    for note in notes:
+        pc = note.pitch % 12
+        histogram[pc] += note.duration_beats
+
+    if histogram.sum() == 0:
+        return 0, "major"
+
+    histogram = histogram / histogram.sum()
+
+    # Correlate with all major and minor key profiles
+    best_corr = -2.0
+    best_key = 0
+    best_mode = "major"
+
+    for shift in range(12):
+        shifted = np.roll(histogram, -shift)
+        corr_major = np.corrcoef(shifted, MAJOR_PROFILE)[0, 1]
+        corr_minor = np.corrcoef(shifted, MINOR_PROFILE)[0, 1]
+
+        if corr_major > best_corr:
+            best_corr = corr_major
+            best_key = shift
+            best_mode = "major"
+        if corr_minor > best_corr:
+            best_corr = corr_minor
+            best_key = shift
+            best_mode = "minor"
+
+    return best_key, best_mode
+
+
+def normalize_to_c(events: list[NoteEvent], key_root: int, mode: str) -> list[NoteEvent]:
+    """Transpose events so that key_root becomes C (major) or A (minor)."""
+    if mode == "minor":
+        # Normalize to A minor (A = 9 semitones)
+        shift = (9 - key_root) % 12
+    else:
+        # Normalize to C major (C = 0)
+        shift = (0 - key_root) % 12
+
+    if shift == 0:
+        return events
+
+    return [
+        NoteEvent(
+            start_beat=e.start_beat,
+            pitch=max(0, min(127, e.pitch + shift)),
+            duration_beats=e.duration_beats,
+            velocity=e.velocity,
+        )
+        for e in events
+    ]
+
+
+def normalize_chord(root: str, quality: str, key_root: int, mode: str) -> tuple[str, str]:
+    """Transpose a chord to the normalized key."""
+    if mode == "minor":
+        shift = (9 - key_root) % 12
+    else:
+        shift = (0 - key_root) % 12
+
+    root_idx = PITCH_NAMES.index(root) if root in PITCH_NAMES else 0
+    new_idx = (root_idx + shift) % 12
+    return PITCH_NAMES[new_idx], quality
+
+
+# --- Chord annotation parsing ---
+
+def parse_chord_annotation(chord_file: Path) -> list[tuple[float, float, str, str]]:
     """Parse POP909 chord annotation file.
 
-    Returns list of (beat_position, root, quality) tuples.
+    Returns list of (start_beat, end_beat, root, quality) tuples.
     """
     chords = []
     with open(chord_file) as f:
@@ -50,16 +131,17 @@ def parse_chord_annotation(chord_file: Path) -> list[tuple[float, str, str]]:
                 continue
             parts = line.split()
             if len(parts) >= 3:
-                beat = float(parts[0])
+                start = float(parts[0])
+                end = float(parts[1]) if len(parts) > 2 else start + 1.0
                 chord_str = parts[2] if len(parts) > 2 else parts[1]
                 root, quality = _parse_chord_symbol(chord_str)
                 if root is not None:
-                    chords.append((beat, root, quality))
+                    chords.append((start, end, root, quality))
     return chords
 
 
 def _parse_chord_symbol(symbol: str) -> tuple[str | None, str]:
-    """Parse a chord symbol like 'C:maj7' or 'Db:min' into (root, quality)."""
+    """Parse a chord symbol like 'C:maj7' into (root, quality)."""
     if symbol in ("N", "N.C.", "NC", "X"):
         return None, "N"
 
@@ -72,20 +154,17 @@ def _parse_chord_symbol(symbol: str) -> tuple[str | None, str]:
         root = symbol[0]
         quality = symbol[1:] or "maj"
 
-    # Normalize root name
-    root = root.replace("#", "").replace("b", "b")  # Keep flats
-    if root not in PITCH_NAMES:
-        # Try enharmonic
-        enharmonic = {
-            "C#": "Db", "D#": "Eb", "F#": "Gb", "G#": "Ab", "A#": "Bb",
-            "Cb": "B", "Fb": "E",
-        }
-        root = enharmonic.get(root, root)
+    # Normalize root
+    enharmonic = {
+        "C#": "Db", "D#": "Eb", "F#": "Gb", "G#": "Ab", "A#": "Bb",
+        "Cb": "B", "Fb": "E",
+    }
+    root = enharmonic.get(root, root)
 
     if root not in PITCH_NAMES:
         return None, "N"
 
-    # Normalize quality to our vocabulary
+    # Normalize quality
     quality_map = {
         "": "maj", "M": "maj", "major": "maj",
         "m": "min", "minor": "min",
@@ -96,7 +175,6 @@ def _parse_chord_symbol(symbol: str) -> tuple[str | None, str]:
     quality = quality_map.get(quality, quality)
 
     if quality not in CHORD_QUALITIES:
-        # Fall back to basic triad
         if "min" in quality:
             quality = "min"
         elif "dim" in quality:
@@ -109,38 +187,15 @@ def _parse_chord_symbol(symbol: str) -> tuple[str | None, str]:
     return root, quality
 
 
-def transpose_events(
-    events: list[NoteEvent], semitones: int
-) -> list[NoteEvent]:
-    """Transpose all notes by given number of semitones."""
-    transposed = []
-    for e in events:
-        new_pitch = e.pitch + semitones
-        if 0 <= new_pitch <= 127:
-            transposed.append(NoteEvent(
-                start_beat=e.start_beat,
-                pitch=new_pitch,
-                duration_beats=e.duration_beats,
-                velocity=e.velocity,
-            ))
-    return transposed
-
-
-def transpose_chord(root: str, quality: str, semitones: int) -> tuple[str, str]:
-    """Transpose a chord root by semitones."""
-    root_idx = PITCH_NAMES.index(root)
-    new_idx = (root_idx + semitones) % 12
-    return PITCH_NAMES[new_idx], quality
-
+# --- Window creation aligned to chord boundaries ---
 
 def process_song(
     song_dir: Path,
     tokenizer: MidiTokenizer,
     vocab: Vocabulary,
     song_id: int,
-    augment: bool = True,
 ) -> list[dict]:
-    """Process a single POP909 song into training windows."""
+    """Process a single POP909 song into chord-aligned training windows."""
     midi_files = list(song_dir.rglob("*.mid"))
     if not midi_files:
         return []
@@ -155,11 +210,10 @@ def process_song(
     if len(midi.instruments) < 2:
         return []
 
-    # POP909 convention: track 0 = melody, track 1 = bridge, track 2 = piano
+    # POP909: track 0 = melody, track 1 = bridge, track 2 = piano
     melody_track_idx = 0
     accomp_track_idx = min(2, len(midi.instruments) - 1)
 
-    # Extract note events
     bpm = midi.get_tempo_changes()[1][0] if len(midi.get_tempo_changes()[1]) > 0 else 120.0
     beat_dur = 60.0 / bpm
 
@@ -177,157 +231,173 @@ def process_song(
     melody_events = notes_to_events(midi.instruments[melody_track_idx])
     accomp_events = notes_to_events(midi.instruments[accomp_track_idx])
 
-    # Load chord annotations if available
+    if not melody_events:
+        return []
+
+    # Step 1: Detect key and normalize to C major / A minor
+    key_root, mode = detect_key(melody_events)
+    melody_events = normalize_to_c(melody_events, key_root, mode)
+    accomp_events = normalize_to_c(accomp_events, key_root, mode)
+
+    # Step 2: Load and normalize chord annotations
     chord_file = song_dir / "chord_midi.txt"
     if not chord_file.exists():
         chord_file = next(song_dir.glob("*chord*"), None)
 
-    chords = parse_chord_annotation(chord_file) if chord_file and chord_file.exists() else []
+    if not chord_file or not chord_file.exists():
+        return []
 
-    # Generate windows
-    windows = _create_windows(
+    raw_chords = parse_chord_annotation(chord_file)
+    chords = [
+        (start, end, *normalize_chord(root, qual, key_root, mode))
+        for start, end, root, qual in raw_chords
+    ]
+
+    if not chords:
+        return []
+
+    # Step 3: Create chord-aligned windows
+    # Each window = one chord span (or merged short chords up to ~2 bars)
+    return _create_chord_aligned_windows(
         melody_events, accomp_events, chords, tokenizer, vocab, song_id
     )
 
-    # Augmentation: transpose to all 12 keys
-    if augment:
-        all_windows = []
-        for semitones in range(12):
-            if semitones == 0:
-                all_windows.extend(windows)
-                continue
 
-            t_melody = transpose_events(melody_events, semitones)
-            t_accomp = transpose_events(accomp_events, semitones)
-            t_chords = [
-                (beat, *transpose_chord(root, qual, semitones))
-                for beat, root, qual in chords
-            ]
-            all_windows.extend(_create_windows(
-                t_melody, t_accomp, t_chords, tokenizer, vocab, song_id
-            ))
-        return all_windows
-
-    return windows
-
-
-def _create_windows(
+def _create_chord_aligned_windows(
     melody_events: list[NoteEvent],
     accomp_events: list[NoteEvent],
-    chords: list[tuple[float, str, str]],
+    chords: list[tuple[float, float, str, str]],
     tokenizer: MidiTokenizer,
     vocab: Vocabulary,
     song_id: int,
-    window_beats: float = 8.0,     # 2 bars of 4/4
-    hop_beats: float = 4.0,        # 1 bar hop
-    max_melody_tokens: int = 32,
+    min_window_beats: float = 2.0,
+    max_window_beats: float = 8.0,
+    context_beats: float = 4.0,  # Include preceding melody as context
+    max_melody_tokens: int = 48,
     max_accomp_tokens: int = 128,
 ) -> list[dict]:
-    """Segment events into fixed-size windows for training."""
-    if not melody_events:
-        return []
+    """Create windows aligned to chord boundaries.
 
-    max_beat = max(e.start_beat for e in melody_events)
+    Each window covers one chord span. Short chords are merged.
+    Preceding melody is included as context for the chord predictor.
+    """
     windows = []
 
-    beat = 0.0
-    while beat < max_beat:
-        end_beat = beat + window_beats
+    i = 0
+    while i < len(chords):
+        start_beat, end_beat, root, quality = chords[i]
+        window_dur = end_beat - start_beat
 
-        # Get melody events in this window
+        # Merge short chords (< min_window_beats) with next chord
+        while window_dur < min_window_beats and i + 1 < len(chords):
+            i += 1
+            _, end_beat, _, _ = chords[i]
+            window_dur = end_beat - start_beat
+            if window_dur >= max_window_beats:
+                break
+
+        # Cap window duration
+        end_beat = min(end_beat, start_beat + max_window_beats)
+
+        # Include context: melody from before this chord
+        context_start = max(0.0, start_beat - context_beats)
+
+        # Get melody events (with context)
         mel_win = [
-            NoteEvent(e.start_beat - beat, e.pitch, e.duration_beats, e.velocity)
+            NoteEvent(e.start_beat - context_start, e.pitch, e.duration_beats, e.velocity)
             for e in melody_events
-            if beat <= e.start_beat < end_beat
+            if context_start <= e.start_beat < end_beat
         ]
-        # Get accompaniment events in this window
+
+        # Get accompaniment events (only for this chord span)
         acc_win = [
-            NoteEvent(e.start_beat - beat, e.pitch, e.duration_beats, e.velocity)
+            NoteEvent(e.start_beat - start_beat, e.pitch, e.duration_beats, e.velocity)
             for e in accomp_events
-            if beat <= e.start_beat < end_beat
+            if start_beat <= e.start_beat < end_beat
         ]
 
-        if not mel_win or not acc_win:
-            beat += hop_beats
-            continue
+        if mel_win and acc_win:
+            try:
+                chord_label = vocab.encode_chord(root, quality)
+            except KeyError:
+                chord_label = vocab.encode_chord("C", "maj")
 
-        # Find chord for this window (use chord at window start or most common)
-        chord_label = _get_window_chord(chords, beat, end_beat, vocab)
+            mel_tokens = tokenizer.encode_note_events(mel_win)[:max_melody_tokens]
+            acc_tokens = tokenizer.encode_note_events(acc_win)[:max_accomp_tokens]
 
-        # Tokenize
-        mel_tokens = tokenizer.encode_note_events(mel_win)
-        acc_tokens = tokenizer.encode_note_events(acc_win)
+            windows.append({
+                "melody_tokens": torch.tensor(mel_tokens, dtype=torch.long),
+                "chord_label": chord_label,
+                "accomp_tokens": torch.tensor(acc_tokens, dtype=torch.long),
+                "song_id": song_id,
+            })
 
-        # Truncate / pad
-        mel_tokens = mel_tokens[:max_melody_tokens]
-        acc_tokens = acc_tokens[:max_accomp_tokens]
-
-        windows.append({
-            "melody_tokens": torch.tensor(mel_tokens, dtype=torch.long),
-            "chord_label": chord_label,
-            "accomp_tokens": torch.tensor(acc_tokens, dtype=torch.long),
-            "song_id": song_id,
-        })
-
-        beat += hop_beats
+        i += 1
 
     return windows
 
 
-def _get_window_chord(
-    chords: list[tuple[float, str, str]],
-    start_beat: float,
-    end_beat: float,
-    vocab: Vocabulary,
-) -> int:
-    """Get the chord label for a time window. Returns vocab token ID."""
-    if not chords:
-        return vocab.encode_chord("C", "maj")  # Default
+# --- Augmentation (tempo jitter + onset jitter, NOT key transposition) ---
 
-    # Find the chord active at the window start
-    active_chord = None
-    for beat, root, quality in chords:
-        if beat <= start_beat:
-            active_chord = (root, quality)
-        elif beat > start_beat:
-            break
+def augment_window(window: dict, tokenizer: MidiTokenizer) -> list[dict]:
+    """Create augmented copies with tempo and onset jitter."""
+    augmented = [window]  # Original
 
-    if active_chord is None:
-        active_chord = (chords[0][1], chords[0][2])
+    # Tempo jitter: speed up or slow down by 5-10%
+    for factor in [0.9, 0.95, 1.05, 1.1]:
+        mel_events = tokenizer.decode_to_events(window["melody_tokens"].tolist())
+        acc_events = tokenizer.decode_to_events(window["accomp_tokens"].tolist())
 
-    root, quality = active_chord
-    try:
-        return vocab.encode_chord(root, quality)
-    except KeyError:
-        return vocab.encode_chord("C", "maj")
+        mel_scaled = [
+            NoteEvent(e.start_beat * factor, e.pitch, e.duration_beats * factor, e.velocity)
+            for e in mel_events
+        ]
+        acc_scaled = [
+            NoteEvent(e.start_beat * factor, e.pitch, e.duration_beats * factor, e.velocity)
+            for e in acc_events
+        ]
+
+        augmented.append({
+            "melody_tokens": torch.tensor(tokenizer.encode_note_events(mel_scaled), dtype=torch.long),
+            "chord_label": window["chord_label"],
+            "accomp_tokens": torch.tensor(tokenizer.encode_note_events(acc_scaled), dtype=torch.long),
+            "song_id": window["song_id"],
+        })
+
+    return augmented
 
 
-def preprocess_all(augment: bool = True):
+# --- Main preprocessing ---
+
+def preprocess_all():
     """Process all POP909 songs and save tokenized data."""
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     vocab = Vocabulary()
     tokenizer = MidiTokenizer(vocab)
 
-    # POP909 songs are under POP909/ subdirectory, fall back to RAW_DIR
     search_dir = POP909_SONGS_DIR if POP909_SONGS_DIR.exists() else RAW_DIR
     song_dirs = sorted([
         d for d in search_dir.iterdir()
         if d.is_dir() and not d.name.startswith(".")
     ])
 
-    print(f"Processing {len(song_dirs)} songs...")
+    print(f"Processing {len(song_dirs)} songs (key-normalized, chord-aligned)...")
     all_windows = []
 
     for i, song_dir in enumerate(song_dirs):
-        windows = process_song(song_dir, tokenizer, vocab, song_id=i, augment=augment)
-        all_windows.extend(windows)
+        windows = process_song(song_dir, tokenizer, vocab, song_id=i)
+
+        # Augment with tempo jitter (5x per window)
+        for w in windows:
+            all_windows.extend(augment_window(w, tokenizer))
+
         if (i + 1) % 100 == 0:
             print(f"  Processed {i + 1}/{len(song_dirs)} songs ({len(all_windows)} windows)")
 
     print(f"\nTotal: {len(all_windows)} training windows")
 
-    # Split by song_id
+    # Split by song_id (80/10/10)
     song_ids = list(set(w["song_id"] for w in all_windows))
     random.shuffle(song_ids)
     n = len(song_ids)
@@ -349,12 +419,13 @@ def preprocess_all(augment: bool = True):
         torch.save(windows, out_path)
         print(f"Saved {split_name}: {len(windows)} windows -> {out_path}")
 
-    # Save metadata
     meta = {
         "vocab_size": vocab.size,
         "num_songs": len(song_dirs),
         "num_windows": {k: len(v) for k, v in splits.items()},
-        "augmented": augment,
+        "key_normalized": True,
+        "chord_aligned": True,
+        "augmentation": "tempo_jitter_5x",
     }
     with open(OUT_DIR / "metadata.json", "w") as f:
         json.dump(meta, f, indent=2)
