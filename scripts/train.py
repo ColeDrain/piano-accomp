@@ -67,7 +67,7 @@ def train_chord_predictor(args):
     train_ds = ChordDataset(args.data, model_cfg["max_melody_tokens"])
     train_loader = DataLoader(
         train_ds, batch_size=train_cfg["batch_size"],
-        shuffle=True, collate_fn=collate_fn, num_workers=8,
+        shuffle=True, collate_fn=collate_fn, num_workers=2,
         pin_memory=True, persistent_workers=True,
     )
 
@@ -77,7 +77,7 @@ def train_chord_predictor(args):
         val_ds = ChordDataset(val_path, model_cfg["max_melody_tokens"])
         val_loader = DataLoader(
             val_ds, batch_size=train_cfg["batch_size"],
-            shuffle=False, collate_fn=collate_fn, num_workers=8,
+            shuffle=False, collate_fn=collate_fn, num_workers=2,
             persistent_workers=True,
         )
 
@@ -118,6 +118,7 @@ def train_chord_predictor(args):
         wandb.init(project="piano-accomp", name=f"chord-{time.strftime('%m%d-%H%M')}")
 
     best_val_score = 0.0
+    patience_counter = 0
     ckpt_dir = Path("checkpoints")
     ckpt_dir.mkdir(exist_ok=True)
 
@@ -212,7 +213,13 @@ def train_chord_predictor(args):
 
         if val_combined > best_val_score:
             best_val_score = val_combined
+            patience_counter = 0
             torch.save(model.state_dict(), ckpt_dir / "chord_best.pt")
+        else:
+            patience_counter += 1
+            if patience_counter >= 5:
+                print(f"  Early stopping at epoch {epoch+1} (no improvement for 5 epochs)")
+                break
 
         if (epoch + 1) % 5 == 0:
             torch.save(model.state_dict(), ckpt_dir / f"chord_epoch{epoch+1}.pt")
@@ -245,7 +252,7 @@ def train_texture_generator(args):
     train_ds = TextureDataset(args.data, chord_cfg["max_melody_tokens"], model_cfg["max_seq_len"])
     train_loader = DataLoader(
         train_ds, batch_size=train_cfg["batch_size"],
-        shuffle=True, collate_fn=collate_fn, num_workers=8,
+        shuffle=True, collate_fn=collate_fn, num_workers=2,
         pin_memory=True, persistent_workers=True,
     )
 
@@ -255,7 +262,7 @@ def train_texture_generator(args):
         val_ds = TextureDataset(val_path, chord_cfg["max_melody_tokens"], model_cfg["max_seq_len"])
         val_loader = DataLoader(
             val_ds, batch_size=train_cfg["batch_size"],
-            shuffle=False, collate_fn=collate_fn, num_workers=8,
+            shuffle=False, collate_fn=collate_fn, num_workers=2,
             persistent_workers=True,
         )
 
