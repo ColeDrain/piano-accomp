@@ -1,33 +1,31 @@
 """
-Stage 2: Texture Generator
+Stage 2: Texture Generator (Structured Chord Conditioning)
 
 Decoder-only Transformer with cross-attention to melody context.
-Generates piano accompaniment tokens (voicing, rhythm, texture) autoregressively,
-conditioned on the predicted chord and melody context.
+Generates piano accompaniment tokens autoregressively.
 
-Input:
-  - Previous accompaniment tokens (autoregressive)
-  - Melody context embedding (from Chord Predictor encoder, via cross-attention)
-  - Chord embedding (concatenated to cross-attention source)
+Chord conditioning uses structured embeddings (per TSHE 2025):
+  - Separate embeddings for root, triad, seventh, bass
+  - Concatenated and projected (not summed — preserves discriminability
+    between gospel chord qualities like 7 vs 7#9)
 
-Output: Next accompaniment token (softmax over full vocabulary)
-
-Architecture: ~25M parameters, KV-cache for streaming inference.
+Architecture: ~34M parameters, KV-cache for streaming inference.
 """
 
 import torch
 import torch.nn as nn
 
 from src.model.transformer import TransformerBlock
+from src.model.chord_predictor import NUM_ROOTS, NUM_TRIADS, NUM_SEVENTHS, NUM_BASS
 
 
 class TextureGenerator(nn.Module):
-    """Generates piano accompaniment texture conditioned on melody and chord."""
+    """Generates piano accompaniment conditioned on structured chord + melody."""
 
     def __init__(
         self,
-        vocab_size: int = 500,
-        num_chord_classes: int = 200,
+        vocab_size: int = 580,
+        num_chord_classes: int = 84,  # Unused, kept for config compat
         embed_dim: int = 512,
         num_layers: int = 8,
         num_heads: int = 8,
@@ -44,15 +42,24 @@ class TextureGenerator(nn.Module):
         self.embed_dim = embed_dim
         self.max_seq_len = max_seq_len
         self.num_layers = num_layers
+        self.chord_embed_dim = chord_embed_dim
 
         # Token embedding for accompaniment sequence
         self.token_embed = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
         self.embed_dropout = nn.Dropout(dropout)
 
-        # Chord conditioning: embed chord class to a vector
-        self.chord_embed = nn.Embedding(num_chord_classes, chord_embed_dim)
+        # Structured chord embeddings — one per component
+        # Each component gets chord_embed_dim // 4 dimensions
+        comp_dim = chord_embed_dim // 4
+        self.root_embed = nn.Embedding(NUM_ROOTS, comp_dim)
+        self.triad_embed = nn.Embedding(NUM_TRIADS, comp_dim)
+        self.seventh_embed = nn.Embedding(NUM_SEVENTHS, comp_dim)
+        self.bass_embed = nn.Embedding(NUM_BASS, comp_dim)
 
-        # Style conditioning (optional): embed style label
+        # Project concatenated components to chord_embed_dim
+        self.chord_proj = nn.Linear(comp_dim * 4, chord_embed_dim)
+
+        # Style conditioning
         self.style_embed = nn.Embedding(num_styles, style_embed_dim)
 
         # Project melody context + chord + style to cross-attention dimension
@@ -87,7 +94,7 @@ class TextureGenerator(nn.Module):
         self,
         accomp_tokens: torch.Tensor,
         melody_context: torch.Tensor,
-        chord_ids: torch.Tensor,
+        chord_components: dict[str, torch.Tensor],
         style_ids: torch.Tensor | None = None,
         kv_caches: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
         position_offset: int = 0,
@@ -95,26 +102,22 @@ class TextureGenerator(nn.Module):
         """
         Args:
             accomp_tokens: (batch, seq_len) previous accompaniment token IDs
-            melody_context: (batch, melody_len, melody_dim) from chord predictor encoder
-            chord_ids: (batch,) predicted chord class IDs
+            melody_context: (batch, melody_len, melody_dim) from chord predictor
+            chord_components: dict with "root" (B,), "triad" (B,), "seventh" (B,), "bass" (B,)
             style_ids: (batch,) optional style label IDs
-            kv_caches: List of (cached_k, cached_v) per layer, or None
-            position_offset: Current position for RoPE (for KV-cache)
+            kv_caches: List of (cached_k, cached_v) per layer
+            position_offset: Current position for RoPE
 
         Returns:
             logits: (batch, seq_len, vocab_size)
-            new_kv_caches: Updated caches for each layer
+            new_kv_caches: Updated caches
         """
-        B = accomp_tokens.shape[0]
-
-        # Embed accompaniment tokens
         x = self.token_embed(accomp_tokens)
         x = self.embed_dropout(x)
 
-        # Build cross-attention source
-        cross_kv = self._build_cross_input(melody_context, chord_ids, style_ids)
+        # Build cross-attention source with structured chord embedding
+        cross_kv = self._build_cross_input(melody_context, chord_components, style_ids)
 
-        # Run through decoder layers
         new_caches = []
         for i, layer in enumerate(self.layers):
             layer_cache = kv_caches[i] if kv_caches is not None else None
@@ -134,18 +137,29 @@ class TextureGenerator(nn.Module):
     def _build_cross_input(
         self,
         melody_context: torch.Tensor,
-        chord_ids: torch.Tensor,
+        chord_components: dict[str, torch.Tensor],
         style_ids: torch.Tensor | None,
     ) -> torch.Tensor:
-        """Build the cross-attention key/value source.
+        """Build cross-attention source with structured chord embedding.
 
-        Concatenates the chord embedding and style embedding to each position
-        of the melody context, then projects to embed_dim.
+        Instead of one flat chord embedding, we embed each component
+        separately and concatenate + project. This gives the model
+        compositional understanding of chord structure.
         """
         B, T_mel, _ = melody_context.shape
 
-        # Chord embedding: (batch, chord_embed_dim) -> (batch, 1, chord_embed_dim) -> broadcast
-        chord_emb = self.chord_embed(chord_ids).unsqueeze(1).expand(-1, T_mel, -1)
+        # Structured chord embedding: concat 4 component embeddings
+        root_emb = self.root_embed(chord_components["root"])       # (B, comp_dim)
+        triad_emb = self.triad_embed(chord_components["triad"])    # (B, comp_dim)
+        seventh_emb = self.seventh_embed(chord_components["seventh"])  # (B, comp_dim)
+        bass_emb = self.bass_embed(chord_components["bass"])       # (B, comp_dim)
+
+        chord_emb = self.chord_proj(
+            torch.cat([root_emb, triad_emb, seventh_emb, bass_emb], dim=-1)
+        )  # (B, chord_embed_dim)
+
+        # Broadcast across melody positions
+        chord_emb = chord_emb.unsqueeze(1).expand(-1, T_mel, -1)
 
         # Style embedding
         if style_ids is not None:
@@ -156,7 +170,6 @@ class TextureGenerator(nn.Module):
                 device=melody_context.device
             )
 
-        # Concatenate and project
         cross_input = torch.cat([melody_context, chord_emb, style_emb], dim=-1)
         return self.cross_proj(cross_input)
 
@@ -164,14 +177,14 @@ class TextureGenerator(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
     # ------------------------------------------------------------------
-    # Autoregressive generation (for inference)
+    # Autoregressive generation
     # ------------------------------------------------------------------
 
     @torch.no_grad()
     def generate(
         self,
         melody_context: torch.Tensor,
-        chord_ids: torch.Tensor,
+        chord_components: dict[str, torch.Tensor],
         style_ids: torch.Tensor | None = None,
         max_tokens: int = 30,
         temperature: float = 0.8,
@@ -181,54 +194,33 @@ class TextureGenerator(nn.Module):
         eos_id: int = 2,
         allowed_token_mask: torch.Tensor | None = None,
     ) -> list[int]:
-        """Generate accompaniment tokens autoregressively.
-
-        Args:
-            melody_context: (1, melody_len, melody_dim)
-            chord_ids: (1,)
-            style_ids: (1,) or None
-            max_tokens: Maximum tokens to generate
-            temperature: Sampling temperature
-            top_k: Top-k sampling
-            top_p: Nucleus sampling threshold
-            bos_id: Beginning-of-sequence token ID
-            eos_id: End-of-sequence token ID
-            allowed_token_mask: (vocab_size,) boolean mask for constrained decoding
-
-        Returns:
-            List of generated token IDs (excluding BOS)
-        """
+        """Generate accompaniment tokens autoregressively."""
         device = melody_context.device
         generated = [bos_id]
         kv_caches = None
         position = 0
 
         for _ in range(max_tokens):
-            # Only feed the last token (KV-cache handles history)
             input_ids = torch.tensor([[generated[-1]]], device=device)
 
             logits, kv_caches = self.forward(
                 accomp_tokens=input_ids,
                 melody_context=melody_context,
-                chord_ids=chord_ids,
+                chord_components=chord_components,
                 style_ids=style_ids,
                 kv_caches=kv_caches,
                 position_offset=position,
             )
 
-            # Get logits for the last (only) position
             next_logits = logits[0, -1, :] / temperature
 
-            # Apply constrained decoding mask
             if allowed_token_mask is not None:
                 next_logits[~allowed_token_mask] = float("-inf")
 
-            # Top-k filtering
             if top_k > 0:
                 indices_to_remove = next_logits < torch.topk(next_logits, top_k)[0][-1]
                 next_logits[indices_to_remove] = float("-inf")
 
-            # Top-p (nucleus) filtering
             if top_p < 1.0:
                 sorted_logits, sorted_indices = torch.sort(next_logits, descending=True)
                 cumulative_probs = torch.cumsum(
@@ -238,7 +230,6 @@ class TextureGenerator(nn.Module):
                 sorted_logits[sorted_mask] = float("-inf")
                 next_logits = sorted_logits.scatter(0, sorted_indices, sorted_logits)
 
-            # Sample
             probs = torch.softmax(next_logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1).item()
 
@@ -248,4 +239,4 @@ class TextureGenerator(nn.Module):
             generated.append(next_token)
             position += 1
 
-        return generated[1:]  # Exclude BOS
+        return generated[1:]

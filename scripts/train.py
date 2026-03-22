@@ -2,20 +2,13 @@
 Training entry point for both the Chord Predictor and Texture Generator.
 
 Usage:
-    # Train chord predictor
     python scripts/train.py --model chord --data data/processed/train.pt
-
-    # Train texture generator
-    python scripts/train.py --model texture --data data/processed/train.pt
-
-    # Train texture generator with pretrained chord predictor
     python scripts/train.py --model texture --data data/processed/train.pt \
         --chord-checkpoint checkpoints/chord_best.pt
 """
 
 import argparse
 import math
-import os
 import time
 from functools import partial
 from pathlib import Path
@@ -32,8 +25,8 @@ from src.model.texture_generator import TextureGenerator
 from src.training.dataset import (
     ChordDataset, TextureDataset, collate_chord, collate_texture
 )
-from src.training.losses import ChordPredictionLoss, TextureGenerationLoss
-from src.training.metrics import chord_accuracy, token_perplexity
+from src.training.losses import TextureGenerationLoss
+from src.training.metrics import token_perplexity
 
 
 def get_device() -> torch.device:
@@ -45,7 +38,6 @@ def get_device() -> torch.device:
 
 
 def get_cosine_schedule(optimizer, warmup_steps: int, total_steps: int):
-    """Cosine learning rate schedule with linear warmup."""
     def lr_lambda(step):
         if step < warmup_steps:
             return step / max(1, warmup_steps)
@@ -54,12 +46,15 @@ def get_cosine_schedule(optimizer, warmup_steps: int, total_steps: int):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
+# =====================================================================
+# Chord Predictor Training (4 decomposed heads)
+# =====================================================================
+
 def train_chord_predictor(args):
-    """Train the decomposed Chord Predictor (root + quality heads)."""
+    """Train the decomposed Chord Predictor (root + triad + seventh + bass)."""
     device = get_device()
     print(f"Device: {device}")
 
-    # Load config
     with open("configs/model.yaml") as f:
         model_cfg = yaml.safe_load(f)["chord_predictor"]
     with open("configs/training.yaml") as f:
@@ -67,28 +62,28 @@ def train_chord_predictor(args):
 
     vocab = Vocabulary()
 
-    # Dataset
+    # Data
     collate_fn = partial(collate_chord, pad_id=vocab.pad_id)
-    train_ds = ChordDataset(args.data, model_cfg["max_melody_tokens"], vocab.chord_offset)
+    train_ds = ChordDataset(args.data, model_cfg["max_melody_tokens"])
     train_loader = DataLoader(
         train_ds, batch_size=train_cfg["batch_size"],
-        shuffle=True, collate_fn=collate_fn, num_workers=8, pin_memory=True, persistent_workers=True,
+        shuffle=True, collate_fn=collate_fn, num_workers=8,
+        pin_memory=True, persistent_workers=True,
     )
 
-    val_ds = None
     val_loader = None
     val_path = Path(args.data).parent / "val.pt"
     if val_path.exists():
-        val_ds = ChordDataset(val_path, model_cfg["max_melody_tokens"], vocab.chord_offset)
+        val_ds = ChordDataset(val_path, model_cfg["max_melody_tokens"])
         val_loader = DataLoader(
             val_ds, batch_size=train_cfg["batch_size"],
-            shuffle=False, collate_fn=collate_fn, num_workers=8, persistent_workers=True,
+            shuffle=False, collate_fn=collate_fn, num_workers=8,
+            persistent_workers=True,
         )
 
-    # Model — decomposed into root (12) + quality (7) heads
+    # Model
     model = ChordPredictor(
         vocab_size=vocab.size,
-        num_chord_classes=model_cfg["num_chord_classes"],
         embed_dim=model_cfg["embed_dim"],
         num_layers=model_cfg["num_layers"],
         num_heads=model_cfg["num_heads"],
@@ -98,9 +93,10 @@ def train_chord_predictor(args):
     ).to(device)
 
     print(f"Chord Predictor: {model.get_num_params():,} parameters")
-    print(f"  Root classes: {model.num_roots}, Quality classes: {model.num_qualities}")
+    print(f"  Heads: root({model.num_roots}) + triad({model.num_triads}) + "
+          f"seventh({model.num_sevenths}) + bass({model.num_bass})")
 
-    # Optimizer and scheduler
+    # Optimizer
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=train_cfg["learning_rate"],
@@ -109,37 +105,42 @@ def train_chord_predictor(args):
     total_steps = len(train_loader) * train_cfg["epochs"]
     scheduler = get_cosine_schedule(optimizer, train_cfg["warmup_steps"], total_steps)
 
-    # Two losses — one per head
+    # Losses — one per head
     smoothing = train_cfg.get("label_smoothing", 0.1)
     root_loss_fn = nn.CrossEntropyLoss(label_smoothing=smoothing)
-    quality_loss_fn = nn.CrossEntropyLoss(label_smoothing=smoothing)
+    triad_loss_fn = nn.CrossEntropyLoss(label_smoothing=smoothing)
+    seventh_loss_fn = nn.CrossEntropyLoss(label_smoothing=smoothing)
+    bass_loss_fn = nn.CrossEntropyLoss(label_smoothing=smoothing)
+    bass_weight = model.bass_loss_weight
 
-    # Optional: wandb
     if args.wandb:
         import wandb
         wandb.init(project="piano-accomp", name=f"chord-{time.strftime('%m%d-%H%M')}")
 
-    # Training loop
-    best_val_acc = 0.0
+    best_val_score = 0.0
     ckpt_dir = Path("checkpoints")
     ckpt_dir.mkdir(exist_ok=True)
 
     for epoch in range(train_cfg["epochs"]):
         model.train()
-        total_loss = 0.0
-        total_root_acc = 0.0
-        total_qual_acc = 0.0
-        num_batches = 0
+        t_loss = t_root = t_triad = t_sev = t_bass = 0.0
+        n_batches = 0
 
         for batch in train_loader:
             melody = batch["melody_tokens"].to(device)
             root = batch["root_label"].to(device)
-            quality = batch["quality_label"].to(device)
+            triad = batch["triad_label"].to(device)
+            seventh = batch["seventh_label"].to(device)
+            bass = batch["bass_label"].to(device)
 
             result = model(melody)
-            loss_root = root_loss_fn(result["root_logits"], root)
-            loss_qual = quality_loss_fn(result["quality_logits"], quality)
-            loss = loss_root + loss_qual
+
+            loss = (
+                root_loss_fn(result["root_logits"], root)
+                + triad_loss_fn(result["triad_logits"], triad)
+                + seventh_loss_fn(result["seventh_logits"], seventh)
+                + bass_weight * bass_loss_fn(result["bass_logits"], bass)
+            )
 
             optimizer.zero_grad()
             loss.backward()
@@ -147,73 +148,88 @@ def train_chord_predictor(args):
             optimizer.step()
             scheduler.step()
 
-            total_loss += loss.item()
-            total_root_acc += (result["root_logits"].argmax(-1) == root).float().mean().item()
-            total_qual_acc += (result["quality_logits"].argmax(-1) == quality).float().mean().item()
-            num_batches += 1
+            t_loss += loss.item()
+            t_root += (result["root_logits"].argmax(-1) == root).float().mean().item()
+            t_triad += (result["triad_logits"].argmax(-1) == triad).float().mean().item()
+            t_sev += (result["seventh_logits"].argmax(-1) == seventh).float().mean().item()
+            t_bass += (result["bass_logits"].argmax(-1) == bass).float().mean().item()
+            n_batches += 1
 
-        avg_loss = total_loss / num_batches
-        avg_root = total_root_acc / num_batches
-        avg_qual = total_qual_acc / num_batches
+        # Averages
+        t_loss /= n_batches
+        t_root /= n_batches
+        t_triad /= n_batches
+        t_sev /= n_batches
+        t_bass /= n_batches
 
         # Validation
-        val_root = val_qual = 0.0
+        v_root = v_triad = v_sev = v_bass = 0.0
         if val_loader:
             model.eval()
-            vr_sum = vq_sum = 0.0
-            v_total = 0
+            vr = vt = vs = vb = 0.0
+            vn = 0
             with torch.no_grad():
                 for batch in val_loader:
                     melody = batch["melody_tokens"].to(device)
                     root = batch["root_label"].to(device)
-                    quality = batch["quality_label"].to(device)
-                    result = model(melody)
-                    vr_sum += (result["root_logits"].argmax(-1) == root).float().mean().item()
-                    vq_sum += (result["quality_logits"].argmax(-1) == quality).float().mean().item()
-                    v_total += 1
-            val_root = vr_sum / v_total
-            val_qual = vq_sum / v_total
+                    triad = batch["triad_label"].to(device)
+                    seventh = batch["seventh_label"].to(device)
+                    bass = batch["bass_label"].to(device)
 
-        combined_val = val_root * val_qual  # Joint accuracy estimate
+                    result = model(melody)
+                    vr += (result["root_logits"].argmax(-1) == root).float().mean().item()
+                    vt += (result["triad_logits"].argmax(-1) == triad).float().mean().item()
+                    vs += (result["seventh_logits"].argmax(-1) == seventh).float().mean().item()
+                    vb += (result["bass_logits"].argmax(-1) == bass).float().mean().item()
+                    vn += 1
+            v_root = vr / vn
+            v_triad = vt / vn
+            v_sev = vs / vn
+            v_bass = vb / vn
+
+        # Combined = product of individual accuracies
+        val_combined = v_root * v_triad * v_sev
 
         print(
             f"Epoch {epoch+1}/{train_cfg['epochs']} | "
-            f"Loss: {avg_loss:.4f} | "
-            f"Root: {avg_root:.3f}/{val_root:.3f} | "
-            f"Quality: {avg_qual:.3f}/{val_qual:.3f} | "
-            f"Combined: {combined_val:.3f} | "
-            f"LR: {scheduler.get_last_lr()[0]:.2e}"
+            f"Loss: {t_loss:.3f} | "
+            f"Root: {t_root:.3f}/{v_root:.3f} | "
+            f"Triad: {t_triad:.3f}/{v_triad:.3f} | "
+            f"7th: {t_sev:.3f}/{v_sev:.3f} | "
+            f"Bass: {t_bass:.3f}/{v_bass:.3f} | "
+            f"Comb: {val_combined:.3f}"
         )
 
         if args.wandb:
             wandb.log({
-                "chord/train_loss": avg_loss,
-                "chord/train_root_acc": avg_root,
-                "chord/train_quality_acc": avg_qual,
-                "chord/val_root_acc": val_root,
-                "chord/val_quality_acc": val_qual,
-                "chord/val_combined": combined_val,
-                "chord/lr": scheduler.get_last_lr()[0],
+                "chord/loss": t_loss,
+                "chord/train_root": t_root, "chord/val_root": v_root,
+                "chord/train_triad": t_triad, "chord/val_triad": v_triad,
+                "chord/train_seventh": t_sev, "chord/val_seventh": v_sev,
+                "chord/train_bass": t_bass, "chord/val_bass": v_bass,
+                "chord/val_combined": val_combined,
             })
 
-        # Save best (based on combined root * quality)
-        if combined_val > best_val_acc:
-            best_val_acc = combined_val
+        if val_combined > best_val_score:
+            best_val_score = val_combined
             torch.save(model.state_dict(), ckpt_dir / "chord_best.pt")
 
         if (epoch + 1) % 5 == 0:
             torch.save(model.state_dict(), ckpt_dir / f"chord_epoch{epoch+1}.pt")
 
-    print(f"\nBest combined val accuracy: {best_val_acc:.3f}")
+    print(f"\nBest combined val score: {best_val_score:.3f}")
     print(f"Best model saved to {ckpt_dir / 'chord_best.pt'}")
 
 
+# =====================================================================
+# Texture Generator Training
+# =====================================================================
+
 def train_texture_generator(args):
-    """Train the Texture Generator model."""
+    """Train the Texture Generator with structured chord conditioning."""
     device = get_device()
     print(f"Device: {device}")
 
-    # Load configs
     with open("configs/model.yaml") as f:
         full_cfg = yaml.safe_load(f)
     model_cfg = full_cfg["texture_generator"]
@@ -224,33 +240,34 @@ def train_texture_generator(args):
 
     vocab = Vocabulary()
 
-    # Dataset
+    # Data
     collate_fn = partial(collate_texture, pad_id=vocab.pad_id)
-    train_ds = TextureDataset(args.data, chord_cfg["max_melody_tokens"], model_cfg["max_seq_len"], vocab.chord_offset)
+    train_ds = TextureDataset(args.data, chord_cfg["max_melody_tokens"], model_cfg["max_seq_len"])
     train_loader = DataLoader(
         train_ds, batch_size=train_cfg["batch_size"],
-        shuffle=True, collate_fn=collate_fn, num_workers=8, pin_memory=True, persistent_workers=True,
+        shuffle=True, collate_fn=collate_fn, num_workers=8,
+        pin_memory=True, persistent_workers=True,
     )
 
-    val_path = Path(args.data).parent / "val.pt"
     val_loader = None
+    val_path = Path(args.data).parent / "val.pt"
     if val_path.exists():
-        val_ds = TextureDataset(val_path, chord_cfg["max_melody_tokens"], model_cfg["max_seq_len"], vocab.chord_offset)
+        val_ds = TextureDataset(val_path, chord_cfg["max_melody_tokens"], model_cfg["max_seq_len"])
         val_loader = DataLoader(
             val_ds, batch_size=train_cfg["batch_size"],
-            shuffle=False, collate_fn=collate_fn, num_workers=8, persistent_workers=True,
+            shuffle=False, collate_fn=collate_fn, num_workers=8,
+            persistent_workers=True,
         )
 
-    # Load pretrained chord predictor for melody encoding
+    # Load pretrained chord predictor (frozen, for melody encoding)
     chord_model = ChordPredictor(
         vocab_size=vocab.size,
-        num_chord_classes=chord_cfg["num_chord_classes"],
         embed_dim=chord_cfg["embed_dim"],
         num_layers=chord_cfg["num_layers"],
         num_heads=chord_cfg["num_heads"],
         ffn_dim=chord_cfg["ffn_dim"],
         max_melody_tokens=chord_cfg["max_melody_tokens"],
-        dropout=0.0,  # No dropout during inference
+        dropout=0.0,
     ).to(device)
 
     if args.chord_checkpoint:
@@ -261,7 +278,6 @@ def train_texture_generator(args):
     # Texture generator
     model = TextureGenerator(
         vocab_size=vocab.size,
-        num_chord_classes=84,  # 12 roots × 7 quality groups (decomposed)
         embed_dim=model_cfg["embed_dim"],
         num_layers=model_cfg["num_layers"],
         num_heads=model_cfg["num_heads"],
@@ -281,11 +297,11 @@ def train_texture_generator(args):
         lr=train_cfg["learning_rate"],
         weight_decay=train_cfg["weight_decay"],
     )
-    total_steps = (len(train_loader) // train_cfg["gradient_accumulation_steps"]) * train_cfg["epochs"]
+    accum = train_cfg.get("gradient_accumulation_steps", 1)
+    total_steps = (len(train_loader) // accum) * train_cfg["epochs"]
     scheduler = get_cosine_schedule(optimizer, train_cfg["warmup_steps"], total_steps)
 
     loss_fn = TextureGenerationLoss(vocab.size, vocab.pad_id)
-    accum_steps = train_cfg["gradient_accumulation_steps"]
 
     if args.wandb:
         import wandb
@@ -303,35 +319,44 @@ def train_texture_generator(args):
         optimizer.zero_grad()
         for step, batch in enumerate(train_loader):
             melody = batch["melody_tokens"].to(device)
-            chord = batch["chord_label"].to(device)
             accomp_in = batch["accomp_input"].to(device)
             accomp_tgt = batch["accomp_target"].to(device)
 
-            # Get melody encoding from frozen chord predictor
+            # Get melody encoding + chord predictions from frozen chord predictor
             with torch.no_grad():
                 result, melody_context = chord_model(melody, return_embedding=True)
-                # Combine root + quality into a single chord ID for texture generator
-                pred_root = result["root_logits"].argmax(dim=-1)
-                pred_qual = result["quality_logits"].argmax(dim=-1)
-                chord_ids = pred_root * 7 + pred_qual  # 0..83
+                chord_components = {
+                    "root": result["root_logits"].argmax(dim=-1),
+                    "triad": result["triad_logits"].argmax(dim=-1),
+                    "seventh": result["seventh_logits"].argmax(dim=-1),
+                    "bass": result["bass_logits"].argmax(dim=-1),
+                }
 
-            # Forward through texture generator
+            # Or use ground-truth chord labels (teacher forcing for chords)
+            # Uncomment to use ground truth instead of predicted chords:
+            # chord_components = {
+            #     "root": batch["root_label"].to(device),
+            #     "triad": batch["triad_label"].to(device),
+            #     "seventh": batch["seventh_label"].to(device),
+            #     "bass": batch["bass_label"].to(device),
+            # }
+
             logits, _ = model(
                 accomp_tokens=accomp_in,
                 melody_context=melody_context,
-                chord_ids=chord_ids,
+                chord_components=chord_components,
             )
 
-            loss = loss_fn(logits, accomp_tgt) / accum_steps
+            loss = loss_fn(logits, accomp_tgt) / accum
             loss.backward()
 
-            if (step + 1) % accum_steps == 0:
+            if (step + 1) % accum == 0:
                 nn.utils.clip_grad_norm_(model.parameters(), train_cfg["gradient_clip_norm"])
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
 
-            total_loss += loss.item() * accum_steps
+            total_loss += loss.item() * accum
             num_batches += 1
 
         avg_loss = total_loss / num_batches
@@ -340,24 +365,26 @@ def train_texture_generator(args):
         val_ppl = float("inf")
         if val_loader:
             model.eval()
-            val_loss_sum = 0.0
-            val_batches = 0
+            val_sum = 0.0
+            val_n = 0
             with torch.no_grad():
                 for batch in val_loader:
                     melody = batch["melody_tokens"].to(device)
-                    chord = batch["chord_label"].to(device)
                     accomp_in = batch["accomp_input"].to(device)
                     accomp_tgt = batch["accomp_target"].to(device)
 
                     result, melody_context = chord_model(melody, return_embedding=True)
-                    pred_root = result["root_logits"].argmax(dim=-1)
-                    pred_qual = result["quality_logits"].argmax(dim=-1)
-                    chord_ids = pred_root * 7 + pred_qual
-                    logits, _ = model(accomp_in, melody_context, chord_ids)
-                    val_ppl_batch = token_perplexity(logits, accomp_tgt, vocab.pad_id)
-                    val_loss_sum += val_ppl_batch
-                    val_batches += 1
-            val_ppl = val_loss_sum / val_batches
+                    chord_components = {
+                        "root": result["root_logits"].argmax(dim=-1),
+                        "triad": result["triad_logits"].argmax(dim=-1),
+                        "seventh": result["seventh_logits"].argmax(dim=-1),
+                        "bass": result["bass_logits"].argmax(dim=-1),
+                    }
+
+                    logits, _ = model(accomp_in, melody_context, chord_components)
+                    val_sum += token_perplexity(logits, accomp_tgt, vocab.pad_id)
+                    val_n += 1
+            val_ppl = val_sum / val_n
 
         print(
             f"Epoch {epoch+1}/{train_cfg['epochs']} | "
@@ -367,8 +394,8 @@ def train_texture_generator(args):
 
         if args.wandb:
             wandb.log({
-                "texture/train_loss": avg_loss,
-                "texture/val_perplexity": val_ppl,
+                "texture/loss": avg_loss,
+                "texture/val_ppl": val_ppl,
                 "texture/lr": scheduler.get_last_lr()[0],
             })
 
@@ -379,16 +406,19 @@ def train_texture_generator(args):
         if (epoch + 1) % 5 == 0:
             torch.save(model.state_dict(), ckpt_dir / f"texture_epoch{epoch+1}.pt")
 
-    print(f"\nBest validation perplexity: {best_val_ppl:.2f}")
+    print(f"\nBest val perplexity: {best_val_ppl:.2f}")
 
+
+# =====================================================================
+# Main
+# =====================================================================
 
 def main():
     parser = argparse.ArgumentParser(description="Train piano accompaniment models")
     parser.add_argument("--model", choices=["chord", "texture"], required=True)
-    parser.add_argument("--data", type=str, required=True, help="Path to train.pt")
-    parser.add_argument("--chord-checkpoint", type=str, default=None,
-                        help="Pretrained chord predictor (for texture training)")
-    parser.add_argument("--wandb", action="store_true", help="Enable wandb logging")
+    parser.add_argument("--data", type=str, required=True)
+    parser.add_argument("--chord-checkpoint", type=str, default=None)
+    parser.add_argument("--wandb", action="store_true")
     args = parser.parse_args()
 
     if args.model == "chord":

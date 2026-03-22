@@ -1,14 +1,15 @@
 """
-REMI-style MIDI tokenizer for melody and accompaniment.
+True REMI MIDI tokenizer for melody and accompaniment.
 
 Converts between pretty_midi.PrettyMIDI objects and token ID sequences.
-Handles both melody (single voice) and accompaniment (polyphonic piano).
+Uses Bar + Position tokens for explicit metrical structure (not TimeShift).
 
-Encoding flow:
-    PrettyMIDI -> list of NoteEvents -> sort by time -> quantize -> token IDs
+REMI encoding per bar:
+    <BAR> Position_0 Pitch_60 Duration_9 Velocity_20 Position_4 Pitch_64 ...
 
-Decoding flow:
-    token IDs -> NoteEvents -> PrettyMIDI
+This gives the model explicit knowledge of where each note falls in the bar,
+which is critical for chord prediction (notes on beat 1 vs beat 3 have
+very different harmonic implications).
 """
 
 from __future__ import annotations
@@ -18,7 +19,10 @@ from dataclasses import dataclass
 import pretty_midi
 import numpy as np
 
-from src.tokenizer.vocab import Vocabulary, DURATION_BINS, TIME_SHIFT_BINS
+from src.tokenizer.vocab import (
+    Vocabulary, DURATION_BINS, TIME_SHIFT_BINS,
+    BEATS_PER_BAR, SUBDIVISIONS_PER_BEAT, NUM_POSITIONS,
+)
 
 
 @dataclass
@@ -31,7 +35,7 @@ class NoteEvent:
 
 
 class MidiTokenizer:
-    """Tokenizes MIDI data using REMI-style representation."""
+    """Tokenizes MIDI data using true REMI representation with Bar + Position."""
 
     def __init__(self, vocab: Vocabulary | None = None):
         self.vocab = vocab or Vocabulary()
@@ -46,31 +50,20 @@ class MidiTokenizer:
         track_idx: int = 0,
         max_bars: int | None = None,
     ) -> list[int]:
-        """Encode a single MIDI track to a token sequence.
-
-        Args:
-            midi: PrettyMIDI object
-            track_idx: Which instrument track to encode
-            max_bars: Optionally limit to first N bars
-
-        Returns:
-            List of token IDs
-        """
+        """Encode a single MIDI track to a token sequence."""
         if not midi.instruments or track_idx >= len(midi.instruments):
             return [self.vocab.bos_id, self.vocab.eos_id]
 
         instrument = midi.instruments[track_idx]
         tempo_changes = midi.get_tempo_changes()
 
-        # Get tempo (use first tempo, or default 120 BPM)
         if len(tempo_changes[1]) > 0:
             bpm = tempo_changes[1][0]
         else:
             bpm = 120.0
 
-        beat_duration = 60.0 / bpm  # seconds per beat
+        beat_duration = 60.0 / bpm
 
-        # Convert notes to NoteEvents in beat-space
         events = []
         for note in instrument.notes:
             start_beat = note.start / beat_duration
@@ -82,11 +75,10 @@ class MidiTokenizer:
                 velocity=note.velocity,
             ))
 
-        # Sort by start time, then by pitch (ascending)
         events.sort(key=lambda e: (e.start_beat, e.pitch))
 
         if max_bars is not None:
-            max_beat = max_bars * 4  # Assume 4/4 time
+            max_beat = max_bars * BEATS_PER_BAR
             events = [e for e in events if e.start_beat < max_beat]
 
         return self._events_to_tokens(events)
@@ -97,27 +89,41 @@ class MidiTokenizer:
         return self._events_to_tokens(events)
 
     def _events_to_tokens(self, events: list[NoteEvent]) -> list[int]:
-        """Convert sorted NoteEvents to token IDs."""
+        """Convert sorted NoteEvents to token IDs using Bar + Position.
+
+        Encoding format per note:
+            [<BAR>] Position_X Pitch_P Duration_D Velocity_V
+
+        <BAR> is emitted at the start of each new bar.
+        Position_X gives the 16th-note position within the current bar.
+        """
         tokens = [self.vocab.bos_id]
-        current_beat = 0.0
+
+        if not events:
+            tokens.append(self.vocab.eos_id)
+            return tokens
+
+        current_bar = -1  # Track which bar we're in
 
         for event in events:
-            # Time shift from current position
-            dt = event.start_beat - current_beat
-            if dt > 0.01:  # Skip negligible shifts
-                # Break large shifts into multiple tokens
-                while dt > TIME_SHIFT_BINS[-1]:
-                    tokens.append(self.vocab.encode_time_shift(TIME_SHIFT_BINS[-1]))
-                    dt -= TIME_SHIFT_BINS[-1]
-                if dt > 0.01:
-                    tokens.append(self.vocab.encode_time_shift(dt))
+            # Determine bar number and position within bar
+            bar_num = int(event.start_beat // BEATS_PER_BAR)
+            beat_in_bar = event.start_beat % BEATS_PER_BAR
+
+            # Emit <BAR> token at the start of each new bar
+            if bar_num > current_bar:
+                # Emit BAR for each bar (including skipped empty bars)
+                for _ in range(bar_num - current_bar):
+                    tokens.append(self.vocab.bar_id)
+                current_bar = bar_num
+
+            # Position within bar (quantized to 16th note)
+            tokens.append(self.vocab.encode_position(beat_in_bar))
 
             # Note: Pitch -> Duration -> Velocity
             tokens.append(self.vocab.encode_pitch(event.pitch))
             tokens.append(self.vocab.encode_duration(event.duration_beats))
             tokens.append(self.vocab.encode_velocity(event.velocity))
-
-            current_beat = event.start_beat
 
         tokens.append(self.vocab.eos_id)
         return tokens
@@ -133,16 +139,11 @@ class MidiTokenizer:
         accomp_track: int = 1,
         max_bars: int | None = None,
     ) -> list[int]:
-        """Encode a melody-accompaniment pair with SEP token between them.
-
-        Returns:
-            [BOS, ...melody tokens..., SEP, ...accompaniment tokens..., EOS]
-        """
+        """Encode a melody-accompaniment pair with SEP token between them."""
         melody_tokens = self.encode_midi(midi, melody_track, max_bars)
         accomp_tokens = self.encode_midi(midi, accomp_track, max_bars)
 
-        # Strip BOS/EOS from individual encodings, combine with SEP
-        melody_body = melody_tokens[1:-1]  # Remove BOS and EOS
+        melody_body = melody_tokens[1:-1]
         accomp_body = accomp_tokens[1:-1]
 
         return [self.vocab.bos_id] + melody_body + [self.vocab.sep_id] + accomp_body + [self.vocab.eos_id]
@@ -157,43 +158,45 @@ class MidiTokenizer:
         bpm: float = 120.0,
         program: int = 0,
     ) -> pretty_midi.PrettyMIDI:
-        """Decode token IDs back to a PrettyMIDI object.
-
-        Args:
-            token_ids: List of token IDs
-            bpm: Tempo for timing conversion
-            program: MIDI program number (0 = Acoustic Grand Piano)
-
-        Returns:
-            PrettyMIDI object
-        """
         events = self.decode_to_events(token_ids)
         return self._events_to_midi(events, bpm, program)
 
     def decode_to_events(self, token_ids: list[int]) -> list[NoteEvent]:
-        """Decode token IDs to NoteEvents."""
+        """Decode token IDs to NoteEvents. Handles both REMI (Bar+Position) and legacy (TimeShift)."""
         events = []
-        current_beat = 0.0
+        current_bar = 0
+        current_beat = 0.0  # Absolute beat position
         i = 0
 
         while i < len(token_ids):
             tid = token_ids[i]
 
-            # Skip special tokens
+            # Special tokens
             if self.vocab.is_special(tid):
-                # SEP resets position (start of accompaniment)
-                if tid == self.vocab.sep_id:
+                if tid == self.vocab.bar_id:
+                    current_bar += 1
+                    current_beat = current_bar * BEATS_PER_BAR
+                elif tid == self.vocab.sep_id:
+                    current_bar = 0
                     current_beat = 0.0
                 i += 1
                 continue
 
-            # Time shift
-            if self.vocab.is_time_shift(tid):
-                current_beat += self.vocab.decode_time_shift(tid)
+            # Position token -> set absolute position within current bar
+            if self.vocab.is_position(tid):
+                beat_in_bar = self.vocab.decode_position(tid)
+                current_beat = (current_bar * BEATS_PER_BAR) + beat_in_bar
                 i += 1
                 continue
 
-            # Chord tokens (skip for now, used by model not for playback)
+            # Legacy TimeShift support
+            if self.vocab.is_time_shift(tid):
+                current_beat += self.vocab.decode_time_shift(tid)
+                current_bar = int(current_beat // BEATS_PER_BAR)
+                i += 1
+                continue
+
+            # Chord tokens (skip during playback)
             if self.vocab.is_chord(tid):
                 i += 1
                 continue
@@ -201,8 +204,8 @@ class MidiTokenizer:
             # Note: expect Pitch, Duration, Velocity in sequence
             if self.vocab.is_pitch(tid):
                 pitch = self.vocab.decode_pitch(tid)
-                duration = DURATION_BINS[0]  # default
-                velocity = 80  # default
+                duration = DURATION_BINS[0]
+                velocity = 80
 
                 if i + 1 < len(token_ids) and self.vocab.is_duration(token_ids[i + 1]):
                     duration = self.vocab.decode_duration(token_ids[i + 1])
@@ -229,7 +232,6 @@ class MidiTokenizer:
         bpm: float,
         program: int,
     ) -> pretty_midi.PrettyMIDI:
-        """Convert NoteEvents to a PrettyMIDI object."""
         beat_duration = 60.0 / bpm
 
         midi = pretty_midi.PrettyMIDI(initial_tempo=bpm)
@@ -254,11 +256,6 @@ class MidiTokenizer:
     # ------------------------------------------------------------------
 
     def split_pair(self, token_ids: list[int]) -> tuple[list[int], list[int]]:
-        """Split a paired sequence at the SEP token.
-
-        Returns:
-            (melody_tokens, accompaniment_tokens) — each with BOS/EOS
-        """
         if self.vocab.sep_id not in token_ids:
             return token_ids, []
 
@@ -268,5 +265,4 @@ class MidiTokenizer:
         return melody, accomp
 
     def tokens_to_str(self, token_ids: list[int]) -> str:
-        """Convert token IDs to a human-readable string for debugging."""
         return " ".join(self.vocab.id_to_token.get(t, f"<UNK:{t}>") for t in token_ids)

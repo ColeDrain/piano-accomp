@@ -1,52 +1,40 @@
 """
-Stage 1: Chord Predictor (Decomposed)
+Stage 1: Chord Predictor (Structured Decomposition)
 
-Predicts chords by decomposing into two easier sub-problems:
-  1. Root prediction: 12 classes (C, Db, D, ..., B) — easy
-  2. Quality prediction: 7 classes (maj, min, 7, maj7, min7, dim, sus) — easy
+Predicts chords by decomposing into four sub-problems:
+  1. Root: 12 classes (C, Db, D, ..., B)
+  2. Triad: 5 classes (maj, min, dim, aug, sus)
+  3. Seventh: 4 classes (none, dom7, maj7, min7)
+  4. Bass: 12 classes (for inversions/slash chords, optional)
 
-This follows the ChordFormer (2025) approach of structured prediction.
-Combined, this gives 12 × 7 = 84 possible chords — enough for accompaniment,
-and each head achieves much higher accuracy than a single 360-class head.
+Follows ChordFormer (2025) and Jiang et al. (ISMIR 2019) structured prediction.
+Each head is easy (80%+ accuracy) vs a single 360-class head (18% accuracy).
 
-Architecture: ~4M parameters
+Includes learnable bigram transition bias for temporal smoothing
+(per ERLD-HC, MDPI 2025).
+
+Architecture: ~5M parameters
 """
 
 import torch
 import torch.nn as nn
 
 from src.model.transformer import TransformerBlock
-
-# Reduced quality vocabulary — group similar chords
-QUALITY_GROUPS = {
-    # Group 0: Major family
-    "maj": 0, "maj9": 0, "add9": 0, "6": 0, "6/9": 0,
-    # Group 1: Minor family
-    "min": 1, "min9": 1, "min6": 1,
-    # Group 2: Dominant 7 family
-    "7": 2, "9": 2, "13": 2, "7#9": 2, "7b9": 2, "7#11": 2, "aug7": 2,
-    # Group 3: Major 7 family
-    "maj7": 3, "maj9": 3, "maj7#11": 3, "add11": 3,
-    # Group 4: Minor 7 family
-    "min7": 4, "min7b5": 4, "min11": 4, "min7add11": 4,
-    # Group 5: Diminished family
-    "dim": 5, "dim7": 5,
-    # Group 6: Suspended / other
-    "sus2": 6, "sus4": 6, "9sus4": 6, "13sus4": 6, "aug": 6,
-}
+from src.tokenizer.vocab import NUM_POSITIONS
 
 NUM_ROOTS = 12
-NUM_QUALITIES = 7
-QUALITY_NAMES = ["maj", "min", "dom7", "maj7", "min7", "dim", "sus"]
+NUM_TRIADS = 5
+NUM_SEVENTHS = 4
+NUM_BASS = 12
 
 
 class ChordPredictor(nn.Module):
-    """Predicts chord root and quality separately from melody context."""
+    """Predicts chord root, triad, seventh, and bass from melody context."""
 
     def __init__(
         self,
-        vocab_size: int = 564,
-        num_chord_classes: int = 360,  # Kept for backward compat, not used
+        vocab_size: int = 580,
+        num_chord_classes: int = 360,  # Unused, kept for config compat
         embed_dim: int = 256,
         num_layers: int = 6,
         num_heads: int = 8,
@@ -54,12 +42,16 @@ class ChordPredictor(nn.Module):
         max_melody_tokens: int = 32,
         dropout: float = 0.2,
         activation: str = "gelu",
+        bass_loss_weight: float = 0.3,
     ):
         super().__init__()
         self.embed_dim = embed_dim
         self.max_melody_tokens = max_melody_tokens
         self.num_roots = NUM_ROOTS
-        self.num_qualities = NUM_QUALITIES
+        self.num_triads = NUM_TRIADS
+        self.num_sevenths = NUM_SEVENTHS
+        self.num_bass = NUM_BASS
+        self.bass_loss_weight = bass_loss_weight
 
         # Token embedding
         self.token_embed = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
@@ -83,7 +75,7 @@ class ChordPredictor(nn.Module):
 
         self.final_norm = nn.LayerNorm(embed_dim)
 
-        # Two separate heads — much easier than one 360-class head
+        # Four classification heads
         self.root_head = nn.Sequential(
             nn.Linear(embed_dim, embed_dim // 2),
             nn.GELU(),
@@ -91,26 +83,45 @@ class ChordPredictor(nn.Module):
             nn.Linear(embed_dim // 2, NUM_ROOTS),
         )
 
-        self.quality_head = nn.Sequential(
+        self.triad_head = nn.Sequential(
             nn.Linear(embed_dim, embed_dim // 2),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(embed_dim // 2, NUM_QUALITIES),
+            nn.Linear(embed_dim // 2, NUM_TRIADS),
         )
+
+        self.seventh_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim // 2, NUM_SEVENTHS),
+        )
+
+        self.bass_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim // 2, NUM_BASS),
+        )
+
+        # Bigram transition bias for root (learned, initialized to uniform)
+        # transition_bias[prev_root] gives logit bias for current root prediction
+        self.root_transition = nn.Parameter(torch.zeros(NUM_ROOTS, NUM_ROOTS))
 
     def forward(
         self,
         melody_tokens: torch.Tensor,
+        prev_root: torch.Tensor | None = None,
         return_embedding: bool = False,
     ) -> dict | tuple[dict, torch.Tensor]:
         """
         Args:
             melody_tokens: (batch, seq_len) token IDs
+            prev_root: (batch,) previous root index for transition bias. None = no bias.
             return_embedding: If True, also return melody context embedding
 
         Returns:
-            dict with "root_logits" (batch, 12) and "quality_logits" (batch, 7)
-            If return_embedding: (dict, melody_embedding)
+            dict with root_logits (B,12), triad_logits (B,5), seventh_logits (B,4), bass_logits (B,12)
         """
         x = self.token_embed(melody_tokens)
         x = self.embed_dropout(x)
@@ -120,11 +131,20 @@ class ChordPredictor(nn.Module):
 
         x = self.final_norm(x)
 
-        last_hidden = x[:, -1, :]  # (batch, embed_dim)
+        last_hidden = x[:, -1, :]
+
+        root_logits = self.root_head(last_hidden)
+
+        # Apply transition bias if previous root is known
+        if prev_root is not None:
+            bias = self.root_transition[prev_root]  # (batch, NUM_ROOTS)
+            root_logits = root_logits + bias
 
         result = {
-            "root_logits": self.root_head(last_hidden),      # (batch, 12)
-            "quality_logits": self.quality_head(last_hidden), # (batch, 7)
+            "root_logits": root_logits,               # (batch, 12)
+            "triad_logits": self.triad_head(last_hidden),    # (batch, 5)
+            "seventh_logits": self.seventh_head(last_hidden), # (batch, 4)
+            "bass_logits": self.bass_head(last_hidden),       # (batch, 12)
         }
 
         if return_embedding:
@@ -132,16 +152,19 @@ class ChordPredictor(nn.Module):
 
         return result
 
-    def predict_chord(self, melody_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Convenience: predict root and quality indices.
+    def predict_chord(self, melody_tokens: torch.Tensor, prev_root: torch.Tensor | None = None) -> dict:
+        """Convenience: predict all component indices.
 
         Returns:
-            (root_ids, quality_ids) each (batch,)
+            dict with root (B,), triad (B,), seventh (B,), bass (B,)
         """
-        result = self.forward(melody_tokens)
-        root_ids = result["root_logits"].argmax(dim=-1)
-        quality_ids = result["quality_logits"].argmax(dim=-1)
-        return root_ids, quality_ids
+        result = self.forward(melody_tokens, prev_root)
+        return {
+            "root": result["root_logits"].argmax(dim=-1),
+            "triad": result["triad_logits"].argmax(dim=-1),
+            "seventh": result["seventh_logits"].argmax(dim=-1),
+            "bass": result["bass_logits"].argmax(dim=-1),
+        }
 
     def get_num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
