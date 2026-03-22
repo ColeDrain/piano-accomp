@@ -8,7 +8,7 @@ chord_predictor:
   ffn_dim: 1024
   dropout: 0.1
   max_melody_tokens: 32        # Context window: ~2-4 bars of melody
-  num_chord_classes: 200        # Gospel-extended chord vocabulary
+  num_chord_classes: 360        # 12 roots × 30 qualities (gospel-extended)
   activation: "gelu"
 
 texture_generator:
@@ -31,7 +31,7 @@ tokenizer:
   num_duration_bins: 32          # 32nd note to whole note
   num_velocity_bins: 32          # Velocity quantization
   num_time_shift_bins: 64        # 1/32 beat to 4 beats
-  num_chord_types: 200           # Including gospel extensions
+  num_chord_types: 360           # 12 roots × 30 qualities
   special_tokens:
     - "<PAD>"
     - "<BOS>"
