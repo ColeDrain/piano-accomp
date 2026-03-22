@@ -1,0 +1,58 @@
+[project]
+name = "piano-accomp"
+version = "0.1.0"
+description = "Real-time ML gospel piano accompaniment for vocalists"
+requires-python = ">=3.11"
+dependencies = [
+    # ML
+    "torch>=2.1.0",
+    "torchaudio>=2.1.0",
+
+    # Audio I/O
+    "sounddevice>=0.4.6",
+
+    # MIDI
+    "mido>=1.3.0",
+    "python-rtmidi>=1.5.0",
+    "pretty_midi>=0.2.10",
+
+    # Pitch detection
+    "torchcrepe>=0.0.22",
+
+    # Audio analysis
+    "librosa>=0.10.0",
+
+    # Synthesis
+    "pyfluidsynth>=1.3.0",
+
+    # Config
+    "pyyaml>=6.0",
+    "numpy>=1.24.0",
+]
+
+[project.optional-dependencies]
+train = [
+    "wandb>=0.15.0",
+    "matplotlib>=3.7.0",
+    "jupyter>=1.0.0",
+    "ipywidgets>=8.0.0",
+]
+deploy = [
+    "coremltools>=7.0",
+    "gradio>=4.0.0",
+]
+dev = [
+    "pytest>=7.0.0",
+    "ruff>=0.1.0",
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["src*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

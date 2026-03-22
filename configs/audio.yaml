@@ -1,0 +1,21 @@
+# Audio I/O configuration
+
+input:
+  sample_rate: 44100
+  channels: 1                       # Mono mic input
+  dtype: "float32"
+  buffer_size: 2048                 # Samples per chunk (~46ms at 44.1kHz)
+  device: null                      # null = system default
+
+output:
+  sample_rate: 44100
+  channels: 2                       # Stereo output
+  buffer_size: 256                  # Low-latency output (~5.8ms)
+  device: null
+
+fluidsynth:
+  soundfont: "soundfonts/salamander_grand_piano.sf2"
+  gain: 0.8                         # Master volume (0.0-10.0)
+  reverb: true
+  chorus: false
+  midi_channel: 0                   # Piano channel

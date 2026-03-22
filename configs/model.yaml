@@ -1,0 +1,48 @@
+# Model architecture configuration
+
+chord_predictor:
+  type: "encoder_transformer"
+  num_layers: 6
+  num_heads: 8
+  embed_dim: 256
+  ffn_dim: 1024
+  dropout: 0.1
+  max_melody_tokens: 32        # Context window: ~2-4 bars of melody
+  num_chord_classes: 200        # Gospel-extended chord vocabulary
+  activation: "gelu"
+
+texture_generator:
+  type: "decoder_transformer_cross_attn"
+  num_layers: 8
+  num_heads: 8
+  embed_dim: 512
+  ffn_dim: 2048
+  dropout: 0.1
+  max_seq_len: 256              # Accompaniment history window
+  melody_context_dim: 256       # Must match chord_predictor.embed_dim
+  chord_embed_dim: 64           # Chord conditioning embedding
+  style_embed_dim: 64           # Optional style conditioning
+  activation: "gelu"
+  use_kv_cache: true
+
+tokenizer:
+  vocab_size: 500
+  pitch_range: [0, 127]         # MIDI pitch range
+  num_duration_bins: 32          # 32nd note to whole note
+  num_velocity_bins: 32          # Velocity quantization
+  num_time_shift_bins: 64        # 1/32 beat to 4 beats
+  num_chord_types: 200           # Including gospel extensions
+  special_tokens:
+    - "<PAD>"
+    - "<BOS>"
+    - "<EOS>"
+    - "<SEP>"                    # Separates melody from accompaniment
+    - "<BAR>"
+    - "<BEAT>"
+    - "<FILL>"                   # Marks fill opportunity
+  style_tokens:
+    - "<STRIDE>"
+    - "<WALKING>"
+    - "<BLOCK>"
+    - "<ARPEGGIO>"
+    - "<FILL_PATTERN>"

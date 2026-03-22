@@ -1,0 +1,27 @@
+# Real-time inference configuration
+
+pitch_detection:
+  model: "crepe"                    # "crepe" or "basic_pitch"
+  crepe_model_size: "tiny"          # tiny (360K params), small, medium, large, full
+  confidence_threshold: 0.5         # Below this -> silence
+  hop_size_ms: 10                   # CREPE step size
+  median_filter_size: 3             # Smooth vibrato
+
+beat_tracking:
+  mode: "fixed"                     # "fixed" (user-set BPM) or "adaptive"
+  default_bpm: 80                   # Default tempo for gospel ballad
+  tap_tempo: true                   # Allow tap-to-set tempo
+
+generation:
+  temperature: 0.8                  # Sampling temperature
+  top_k: 50                         # Top-k sampling
+  top_p: 0.9                        # Nucleus sampling
+  max_tokens_per_beat: 30           # Safety limit
+  use_kv_cache: true
+  constrained_decoding: true        # Mask tokens outside current chord
+
+engine:
+  audio_chunk_ms: 50                # Mic input buffer size
+  chord_update_interval: "beat"     # Predict new chord every beat
+  num_threads: 3                    # Audio in, model, audio out
+  queue_size: 16                    # Inter-thread queue depth

@@ -1,0 +1,46 @@
+# Data (large files)
+data/raw/
+data/processed/
+soundfonts/*.sf2
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environment
+.env
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Experiment tracking
+wandb/
+
+# Model checkpoints
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+
+# CoreML
+*.mlmodel
+*.mlpackage
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Memory (claude)
+memory/
