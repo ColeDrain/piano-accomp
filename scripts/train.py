@@ -72,7 +72,7 @@ def train_chord_predictor(args):
     train_ds = ChordDataset(args.data, model_cfg["max_melody_tokens"], vocab.chord_offset)
     train_loader = DataLoader(
         train_ds, batch_size=train_cfg["batch_size"],
-        shuffle=True, collate_fn=collate_fn, num_workers=4, pin_memory=True,
+        shuffle=True, collate_fn=collate_fn, num_workers=8, pin_memory=True, persistent_workers=True,
     )
 
     val_ds = None
@@ -82,7 +82,7 @@ def train_chord_predictor(args):
         val_ds = ChordDataset(val_path, model_cfg["max_melody_tokens"], vocab.chord_offset)
         val_loader = DataLoader(
             val_ds, batch_size=train_cfg["batch_size"],
-            shuffle=False, collate_fn=collate_fn, num_workers=4,
+            shuffle=False, collate_fn=collate_fn, num_workers=8, persistent_workers=True,
         )
 
     # Model
@@ -218,7 +218,7 @@ def train_texture_generator(args):
     train_ds = TextureDataset(args.data, chord_cfg["max_melody_tokens"], model_cfg["max_seq_len"], vocab.chord_offset)
     train_loader = DataLoader(
         train_ds, batch_size=train_cfg["batch_size"],
-        shuffle=True, collate_fn=collate_fn, num_workers=4, pin_memory=True,
+        shuffle=True, collate_fn=collate_fn, num_workers=8, pin_memory=True, persistent_workers=True,
     )
 
     val_path = Path(args.data).parent / "val.pt"
@@ -227,7 +227,7 @@ def train_texture_generator(args):
         val_ds = TextureDataset(val_path, chord_cfg["max_melody_tokens"], model_cfg["max_seq_len"], vocab.chord_offset)
         val_loader = DataLoader(
             val_ds, batch_size=train_cfg["batch_size"],
-            shuffle=False, collate_fn=collate_fn, num_workers=4,
+            shuffle=False, collate_fn=collate_fn, num_workers=8, persistent_workers=True,
         )
 
     # Load pretrained chord predictor for melody encoding

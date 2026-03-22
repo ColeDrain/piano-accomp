@@ -6,7 +6,7 @@ chord_predictor:
   num_heads: 8
   embed_dim: 256
   ffn_dim: 1024
-  dropout: 0.1
+  dropout: 0.2
   max_melody_tokens: 32        # Context window: ~2-4 bars of melody
   num_chord_classes: 360        # 12 roots × 30 qualities (gospel-extended)
   activation: "gelu"
