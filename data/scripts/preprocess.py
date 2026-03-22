@@ -32,6 +32,8 @@ from src.tokenizer.vocab import Vocabulary, PITCH_NAMES, CHORD_QUALITIES
 
 DATA_DIR = Path(__file__).parent.parent
 RAW_DIR = DATA_DIR / "raw" / "pop909"
+# POP909 repo nests songs under a POP909/ subdirectory
+POP909_SONGS_DIR = RAW_DIR / "POP909"
 OUT_DIR = DATA_DIR / "processed"
 
 
@@ -307,8 +309,10 @@ def preprocess_all(augment: bool = True):
     vocab = Vocabulary()
     tokenizer = MidiTokenizer(vocab)
 
+    # POP909 songs are under POP909/ subdirectory, fall back to RAW_DIR
+    search_dir = POP909_SONGS_DIR if POP909_SONGS_DIR.exists() else RAW_DIR
     song_dirs = sorted([
-        d for d in RAW_DIR.iterdir()
+        d for d in search_dir.iterdir()
         if d.is_dir() and not d.name.startswith(".")
     ])
 
