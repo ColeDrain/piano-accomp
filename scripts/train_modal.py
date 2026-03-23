@@ -126,13 +126,22 @@ def train_all():
     from scripts.train import train_texture_generator
     import argparse
 
+    # Resume from volume checkpoint if available
+    texture_resume = f"{checkpoints_dir}/texture_best.pt"
+    if os.path.exists(texture_resume):
+        print(f"Resuming texture generator from {texture_resume}", flush=True)
+        os.makedirs(ckpt_dir, exist_ok=True)
+        shutil.copy2(texture_resume, f"{ckpt_dir}/texture_best.pt")
+
     args = argparse.Namespace(
         model="texture",
         data=f"{processed_dir}/train.pt",
         chord_checkpoint=chord_ckpt,
+        save_dir=checkpoints_dir,  # Save to volume after every improvement
         wandb=False,
     )
     train_texture_generator(args)
+    volume.commit()
 
     # Step 6: Save checkpoints
     print("\n" + "=" * 60, flush=True)

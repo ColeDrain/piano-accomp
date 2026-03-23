@@ -411,6 +411,13 @@ def train_texture_generator(args):
             best_val_ppl = val_ppl
             tex_patience = 0
             torch.save(model.state_dict(), ckpt_dir / "texture_best.pt")
+            # Copy to extra save dir (e.g. Modal volume) for persistence
+            if hasattr(args, 'save_dir') and args.save_dir:
+                import shutil
+                save_dir = Path(args.save_dir)
+                save_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(ckpt_dir / "texture_best.pt", save_dir / "texture_best.pt")
+                print(f"  Saved to {save_dir / 'texture_best.pt'}", flush=True)
         else:
             tex_patience += 1
             if tex_patience >= 5:
@@ -432,6 +439,8 @@ def main():
     parser.add_argument("--model", choices=["chord", "texture"], required=True)
     parser.add_argument("--data", type=str, required=True)
     parser.add_argument("--chord-checkpoint", type=str, default=None)
+    parser.add_argument("--save-dir", type=str, default=None,
+                        help="Extra directory to copy best checkpoints to (e.g. Modal volume)")
     parser.add_argument("--wandb", action="store_true")
     args = parser.parse_args()
 
