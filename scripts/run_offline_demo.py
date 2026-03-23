@@ -33,7 +33,6 @@ def load_models(args, vocab: Vocabulary, device: torch.device):
 
     chord_model = ChordPredictor(
         vocab_size=vocab.size,
-        num_chord_classes=chord_cfg["num_chord_classes"],
         embed_dim=chord_cfg["embed_dim"],
         num_layers=chord_cfg["num_layers"],
         num_heads=chord_cfg["num_heads"],
@@ -46,7 +45,6 @@ def load_models(args, vocab: Vocabulary, device: torch.device):
 
     texture_model = TextureGenerator(
         vocab_size=vocab.size,
-        num_chord_classes=chord_cfg["num_chord_classes"],
         embed_dim=tex_cfg["embed_dim"],
         num_layers=tex_cfg["num_layers"],
         num_heads=tex_cfg["num_heads"],
@@ -115,16 +113,21 @@ def generate_accompaniment(
         mel_tokens = tokenizer.encode_note_events(mel_events)
         mel_tensor = torch.tensor([mel_tokens[:32]], device=device)
 
-        # Predict chord
+        # Predict chord (decomposed heads)
         with torch.no_grad():
-            chord_logits, melody_context = chord_model(mel_tensor, return_embedding=True)
-            chord_id = chord_logits.argmax(dim=-1)  # (1,)
+            result, melody_context = chord_model(mel_tensor, return_embedding=True)
+            chord_components = {
+                "root": result["root_logits"].argmax(dim=-1),
+                "triad": result["triad_logits"].argmax(dim=-1),
+                "seventh": result["seventh_logits"].argmax(dim=-1),
+                "bass": result["bass_logits"].argmax(dim=-1),
+            }
 
         # Generate accompaniment tokens
         with torch.no_grad():
             accomp_tokens = texture_model.generate(
                 melody_context=melody_context,
-                chord_ids=chord_id,
+                chord_components=chord_components,
                 max_tokens=30,
                 temperature=temperature,
                 bos_id=vocab.bos_id,
