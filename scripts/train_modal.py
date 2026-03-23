@@ -24,8 +24,8 @@ VOLUME_PATH = "/data"
 
 @app.function(
     image=image,
-    gpu="L4",
-    timeout=14400,
+    gpu="H100",
+    timeout=7200,
     volumes={VOLUME_PATH: volume},
 )
 def train_all():
