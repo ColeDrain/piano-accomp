@@ -26,7 +26,7 @@ from src.tokenizer.vocab import PITCH_NAMES, quality_to_triad, TRIAD_NAMES
 
 @dataclass
 class PianoPattern:
-    """A single measure of piano accompaniment from POP909."""
+    """A single measure of piano accompaniment."""
     notes: list[tuple[float, float, int, int]]  # (start_beat, duration_beat, pitch, velocity)
     chord_root: int       # 0-11
     chord_quality: str    # "maj", "min", etc.
@@ -37,6 +37,7 @@ class PianoPattern:
     has_bass: bool        # Has notes below C3 (48)
     density: float        # notes per beat
     song_id: int
+    is_gospel: bool = False  # True for gospel-style patterns
 
 
 @dataclass
@@ -62,6 +63,7 @@ class PatternLibrary:
         target_triad: int,
         prev_pattern: PianoPattern | None = None,
         prefer_bass: bool = True,
+        prefer_gospel: bool = False,
         min_notes: int = 3,
         max_notes: int = 30,
         top_k: int = 10,
@@ -80,6 +82,12 @@ class PatternLibrary:
         if not candidates:
             # Fallback: any major/minor pattern
             candidates = self._by_triad.get(0, []) + self._by_triad.get(1, [])
+
+        # If prefer_gospel, filter to gospel-only first
+        if prefer_gospel:
+            gospel_candidates = [i for i in candidates if self.patterns[i].is_gospel]
+            if len(gospel_candidates) >= 3:
+                candidates = gospel_candidates
 
         if not candidates:
             return None
@@ -101,6 +109,10 @@ class PatternLibrary:
             # Prefer patterns with bass
             if prefer_bass and p.has_bass:
                 score += 2.0
+
+            # Strong preference for gospel patterns when requested
+            if prefer_gospel and p.is_gospel:
+                score += 10.0
 
             # Prefer moderate density (5-15 notes per 4 beats)
             if 5 <= p.num_notes <= 15:

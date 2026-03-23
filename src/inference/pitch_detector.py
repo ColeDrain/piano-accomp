@@ -16,6 +16,17 @@ import numpy as np
 import torch
 import torchaudio.functional as AF
 
+# Patch resampy's pkg_resources dependency before importing torchcrepe
+import importlib
+import types
+_fake_pkg = types.ModuleType("pkg_resources")
+_fake_pkg.resource_filename = lambda *a: ""
+import sys
+if "pkg_resources" not in sys.modules:
+    sys.modules["pkg_resources"] = _fake_pkg
+
+import torchcrepe
+
 
 # MIDI note number <-> frequency conversion
 def freq_to_midi(freq: float) -> int:
@@ -75,8 +86,6 @@ class PitchDetector:
                 {"type": "note_off", "pitch": int}
                 {"type": "pitch", "pitch": int, "confidence": float}  # continuous pitch info
         """
-        import torchcrepe
-
         # Resample 44.1kHz -> 16kHz
         audio_tensor = torch.from_numpy(audio).float().to(self.device)
         if self.sample_rate != self.crepe_sample_rate:

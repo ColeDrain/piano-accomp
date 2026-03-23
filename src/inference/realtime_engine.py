@@ -3,14 +3,12 @@ Real-time inference engine — the orchestrator.
 
 Pipeline:
     Mic → PitchDetector → melody notes
-    → Rule-based chord detection → chord (root, triad, quality)
+    → Rule-based chord detection → chord
     → Pattern retrieval from POP909 → piano MIDI events
     → FluidSynth → speaker
 
-Three threads:
-1. Audio input: reads mic → pitch detection → melody note queue
-2. Chord + retrieval: reads melody notes → chord detection → pattern retrieval → MIDI queue
-3. Main thread: MIDI playback via FluidSynth
+Updates chord every 2 beats (~1.5s at 80 BPM) for responsiveness.
+Prints detected notes and chords so you can see it's tracking you.
 """
 
 from __future__ import annotations
@@ -33,12 +31,20 @@ from src.inference.pattern_retrieval import (
     PatternLibrary, load_library, build_library_from_pop909, save_library,
 )
 
+import pretty_midi
+
 TRIAD_NAMES = ["maj", "min", "dim", "aug", "sus"]
 LIBRARY_CACHE = "data/processed/pattern_library.pkl"
 
+NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+
+
+def midi_to_note_name(midi_num: int) -> str:
+    return f"{NOTE_NAMES[midi_num % 12]}{midi_num // 12 - 1}"
+
 
 class RealtimeEngine:
-    """Real-time vocal-to-piano accompaniment using rule-based chords + pattern retrieval."""
+    """Real-time vocal-to-piano accompaniment."""
 
     def __init__(
         self,
@@ -51,11 +57,10 @@ class RealtimeEngine:
         self.sample_rate = sample_rate
         self.chunk_size = chunk_size
 
-        # Components
         self.pitch_detector = PitchDetector(
             sample_rate=sample_rate,
             crepe_model="tiny",
-            confidence_threshold=0.5,
+            confidence_threshold=0.4,
             median_filter_size=3,
         )
         self.beat_tracker = BeatTracker(bpm=bpm)
@@ -71,16 +76,16 @@ class RealtimeEngine:
             save_library(self.library, LIBRARY_CACHE)
 
         # Queues
-        self._melody_queue: queue.Queue[dict] = queue.Queue(maxsize=64)
-        self._midi_queue: queue.Queue[list[dict]] = queue.Queue(maxsize=64)
+        self._melody_queue: queue.Queue[dict] = queue.Queue(maxsize=128)
 
         # State
         self._running = False
         self._threads: list[threading.Thread] = []
         self._melody_notes: list[NoteEvent] = []
-        self._last_chord_beat: float = -1.0
         self._prev_pattern = None
-        self._key_root: int = 0  # Detected key, updated periodically
+        self._key_root: int = 0
+        self._last_chord_time: float = 0.0
+        self._current_chord_str: str = ""
 
     def start(self):
         print(f"Starting engine at {self.beat_tracker.bpm:.0f} BPM")
@@ -90,19 +95,12 @@ class RealtimeEngine:
         self.synth.start()
         self.beat_tracker.start()
 
-        # Chord + retrieval thread
-        inference_thread = threading.Thread(
-            target=self._inference_loop, name="inference", daemon=True
+        # Chord + retrieval + playback thread (combined for timing)
+        engine_thread = threading.Thread(
+            target=self._engine_loop, name="engine", daemon=True
         )
-        inference_thread.start()
-        self._threads.append(inference_thread)
-
-        # Playback thread
-        playback_thread = threading.Thread(
-            target=self._playback_loop, name="playback", daemon=True
-        )
-        playback_thread.start()
-        self._threads.append(playback_thread)
+        engine_thread.start()
+        self._threads.append(engine_thread)
 
         # Audio input
         self._audio_stream = sd.InputStream(
@@ -114,8 +112,8 @@ class RealtimeEngine:
         )
         self._audio_stream.start()
 
-        print("Engine running. Sing into your mic!")
-        print("Controls: t=tap tempo, b <num>=set BPM, q=quit")
+        print("\nEngine running! Sing into your mic.")
+        print("You should see detected notes below.\n")
 
     def stop(self):
         print("\nStopping engine...")
@@ -151,125 +149,94 @@ class RealtimeEngine:
             except queue.Full:
                 pass
 
-    # --- Chord detection + pattern retrieval thread ---
+    # --- Main engine loop (chord detection + retrieval + playback) ---
 
-    def _inference_loop(self):
+    def _engine_loop(self):
+        """Single loop handling chord detection, pattern retrieval, and playback timing."""
         while self._running:
-            # Collect melody events
-            try:
-                event = self._melody_queue.get(timeout=0.05)
-            except queue.Empty:
-                continue
+            # Drain melody queue
+            got_new_note = False
+            while True:
+                try:
+                    event = self._melody_queue.get_nowait()
+                except queue.Empty:
+                    break
 
-            if event["type"] == "note_on":
-                beat_pos = self.beat_tracker.get_beat_position()
-                self._melody_notes.append(NoteEvent(
-                    start_beat=beat_pos,
-                    pitch=event["pitch"],
-                    duration_beats=0.5,
-                    velocity=event.get("velocity", 80),
-                ))
-                # Keep last 16 notes
-                if len(self._melody_notes) > 16:
-                    self._melody_notes = self._melody_notes[-16:]
+                if event["type"] == "note_on":
+                    note_name = midi_to_note_name(event["pitch"])
+                    print(f"  ♪ {note_name}", end="", flush=True)
+                    got_new_note = True
 
-            # Update key estimate periodically (every 8 notes)
-            if len(self._melody_notes) >= 8 and len(self._melody_notes) % 8 == 0:
-                self._key_root = detect_key_from_notes(self._melody_notes)
+                    self._melody_notes.append(NoteEvent(
+                        start_beat=time.monotonic(),
+                        pitch=event["pitch"],
+                        duration_beats=0.5,
+                        velocity=event.get("velocity", 80),
+                    ))
+                    if len(self._melody_notes) > 16:
+                        self._melody_notes = self._melody_notes[-16:]
 
-            # Generate accompaniment on each beat
-            current_beat = self.beat_tracker.get_beat_position()
-            beats_since_last = current_beat - self._last_chord_beat
+            # Check if we should update the chord (every 1.5 seconds)
+            now = time.monotonic()
+            if now - self._last_chord_time >= 1.5 and len(self._melody_notes) >= 2:
+                self._last_chord_time = now
 
-            if beats_since_last >= 4.0 and len(self._melody_notes) >= 3:
-                self._last_chord_beat = current_beat
-                midi_events = self._generate_accompaniment()
-                if midi_events:
-                    try:
-                        self._midi_queue.put_nowait(midi_events)
-                    except queue.Full:
-                        pass
+                # Update key
+                if len(self._melody_notes) >= 6:
+                    self._key_root = detect_key_from_notes(self._melody_notes)
 
-    def _generate_accompaniment(self) -> list[dict]:
-        """Detect chord from recent melody notes, retrieve a matching pattern."""
-        if len(self._melody_notes) < 2:
-            return []
+                # Detect chord
+                root, triad, quality = detect_chord_from_notes(
+                    self._melody_notes[-8:],
+                    key_root=self._key_root,
+                    prefer_diatonic=True,
+                )
 
-        # Rule-based chord detection
-        root, triad, quality = detect_chord_from_notes(
-            self._melody_notes[-8:],
-            key_root=self._key_root,
-            prefer_diatonic=True,
-        )
+                chord_str = f"{PITCH_NAMES[root]} {quality}"
+                if chord_str != self._current_chord_str:
+                    self._current_chord_str = chord_str
+                    print(f"\n  → Chord: {chord_str}", flush=True)
 
-        # Retrieve pattern
-        pattern = self.library.retrieve(
-            target_root=root,
-            target_triad=triad,
-            prev_pattern=self._prev_pattern,
-            prefer_bass=True,
-        )
+                # Retrieve and play pattern
+                pattern = self.library.retrieve(
+                    target_root=root,
+                    target_triad=triad,
+                    prev_pattern=self._prev_pattern,
+                    prefer_bass=True,
+                )
 
-        if not pattern:
-            return []
+                if pattern:
+                    self._prev_pattern = pattern
+                    self._play_pattern(pattern)
 
-        self._prev_pattern = pattern
+            time.sleep(0.02)  # 20ms loop rate
 
-        # Convert pattern notes to MIDI events for FluidSynth
-        midi_events = []
+    def _play_pattern(self, pattern):
+        """Play a pattern with proper timing — notes spaced out over the measure."""
         beat_dur = self.beat_tracker.beat_duration
 
-        for start_beat, dur_beat, pitch, velocity in pattern.notes:
-            delay_sec = start_beat * beat_dur
-            dur_sec = dur_beat * beat_dur
-            midi_events.append({
-                "type": "note_on",
-                "pitch": pitch,
-                "velocity": velocity,
-                "delay": delay_sec,
-                "duration": dur_sec,
-            })
+        # Stop previous notes
+        self.synth.all_notes_off()
 
-        return midi_events
+        # Sort notes by start time
+        sorted_notes = sorted(pattern.notes, key=lambda n: n[0])
 
-    # --- MIDI playback thread ---
+        # Play notes with timing
+        base_time = time.monotonic()
+        for start_beat, dur_beat, pitch, velocity in sorted_notes:
+            # Wait until the right time for this note
+            target_time = base_time + (start_beat * beat_dur)
+            wait = target_time - time.monotonic()
+            if wait > 0 and wait < 4.0:  # Don't wait more than 4 seconds
+                time.sleep(wait)
 
-    def _playback_loop(self):
-        pending_offs: list[tuple[float, int]] = []
+            if not self._running:
+                break
 
-        while self._running:
-            now = time.monotonic()
+            self.synth.note_on(pitch, velocity)
 
-            # Process pending note-offs
-            still_pending = []
-            for off_time, pitch in pending_offs:
-                if now >= off_time:
-                    self.synth.note_off(pitch)
-                else:
-                    still_pending.append((off_time, pitch))
-            pending_offs = still_pending
-
-            # Check for new events
-            try:
-                events = self._midi_queue.get(timeout=0.01)
-            except queue.Empty:
-                continue
-
-            # Clear previous accompaniment
-            self.synth.all_notes_off()
-            pending_offs.clear()
-
-            # Schedule new notes with timing
-            base_time = time.monotonic()
-            for event in events:
-                if event["type"] == "note_on":
-                    delay = event.get("delay", 0)
-                    duration = event.get("duration", 0.5)
-
-                    # Schedule note-on (approximate timing via sleep in a helper)
-                    # For simplicity, play all notes immediately but schedule note-offs
-                    self.synth.note_on(event["pitch"], event.get("velocity", 80))
-                    pending_offs.append((base_time + delay + duration, event["pitch"]))
+            # Schedule note-off after duration
+            # (We just let notes ring and cut them on next pattern)
 
     def __enter__(self):
         self.start()
