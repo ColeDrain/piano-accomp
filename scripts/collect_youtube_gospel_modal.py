@@ -14,8 +14,8 @@ app = modal.App("piano-youtube-gospel")
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install(
-        "yt-dlp", "torch", "torchaudio", "torchcrepe", "torchcodec",
-        "numpy", "pretty_midi", "soundfile", "setuptools",
+        "yt-dlp", "torch", "torchaudio", "torchcrepe",
+        "numpy", "pretty_midi", "soundfile", "resampy", "setuptools",
     )
     .apt_install("ffmpeg")
 )
@@ -122,19 +122,22 @@ def download_and_transcribe(query: str, max_videos: int = 3):
     for wav_path in wav_files:
         try:
             import torch
-            import torchaudio
+            import soundfile as sf
+            import resampy
             import torchcrepe
             import pretty_midi
             import numpy as np
 
             print(f"  Transcribing {wav_path.name}...", flush=True)
 
-            waveform, sr = torchaudio.load(str(wav_path))
-            if waveform.shape[0] > 1:
-                waveform = waveform.mean(dim=0, keepdim=True)
+            # Use soundfile instead of torchaudio (avoids torchcodec)
+            audio_np, sr = sf.read(str(wav_path), dtype="float32")
+            if audio_np.ndim > 1:
+                audio_np = audio_np.mean(axis=1)
             if sr != 16000:
-                waveform = torchaudio.functional.resample(waveform, sr, 16000)
+                audio_np = resampy.resample(audio_np, sr, 16000)
                 sr = 16000
+            waveform = torch.from_numpy(audio_np).float().unsqueeze(0)
 
             # Run torchcrepe
             pitch_hz, confidence = torchcrepe.predict(
