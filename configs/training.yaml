@@ -18,7 +18,7 @@ texture_generator:
   weight_decay: 0.01
   warmup_steps: 1000
   scheduler: "cosine"
-  epochs: 40
+  epochs: 20
   label_smoothing: 0.0
   gradient_clip_norm: 1.0
   optimizer: "adamw"

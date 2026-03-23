@@ -26,8 +26,8 @@ VOLUME_PATH = "/data"
 
 @app.function(
     image=image,
-    gpu="T4",
-    timeout=7200,  # 2 hours max
+    gpu="L4",
+    timeout=14400,  # 4 hours max
     volumes={VOLUME_PATH: volume},
 )
 def train_all():
@@ -98,17 +98,32 @@ def train_all():
             shutil.copy2(f"{processed_dir}/{f}", f"{processed_cache}/{f}")
         volume.commit()
 
-    # Train chord predictor
-    print("\n" + "=" * 60)
-    print("STEP 4: Train Chord Predictor")
-    print("=" * 60)
     env = os.environ.copy()
     env["PYTHONPATH"] = work_dir
-    subprocess.run(
-        ["python", "scripts/train.py", "--model", "chord",
-         "--data", f"{processed_dir}/train.pt"],
-        check=True, env=env,
-    )
+    ckpt_dir = f"{work_dir}/checkpoints"
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    # Reuse cached chord checkpoint if available
+    chord_ckpt = f"{ckpt_dir}/chord_best.pt"
+    if os.path.exists(f"{checkpoints_dir}/chord_best.pt"):
+        print("\n" + "=" * 60)
+        print("STEP 4: Using cached Chord Predictor checkpoint")
+        print("=" * 60)
+        shutil.copy2(f"{checkpoints_dir}/chord_best.pt", chord_ckpt)
+    else:
+        print("\n" + "=" * 60)
+        print("STEP 4: Train Chord Predictor")
+        print("=" * 60)
+        subprocess.run(
+            ["python", "scripts/train.py", "--model", "chord",
+             "--data", f"{processed_dir}/train.pt"],
+            check=True, env=env,
+        )
+        # Cache chord checkpoint immediately
+        os.makedirs(checkpoints_dir, exist_ok=True)
+        if os.path.exists(chord_ckpt):
+            shutil.copy2(chord_ckpt, f"{checkpoints_dir}/chord_best.pt")
+            volume.commit()
 
     # Train texture generator
     print("\n" + "=" * 60)
@@ -117,16 +132,15 @@ def train_all():
     subprocess.run(
         ["python", "scripts/train.py", "--model", "texture",
          "--data", f"{processed_dir}/train.pt",
-         "--chord-checkpoint", f"{work_dir}/checkpoints/chord_best.pt"],
+         "--chord-checkpoint", chord_ckpt],
         check=True, env=env,
     )
 
-    # Save checkpoints to volume
+    # Save all checkpoints to volume
     print("\n" + "=" * 60)
     print("STEP 6: Save checkpoints")
     print("=" * 60)
     os.makedirs(checkpoints_dir, exist_ok=True)
-    ckpt_dir = f"{work_dir}/checkpoints"
     for f in os.listdir(ckpt_dir):
         if f.endswith(".pt"):
             shutil.copy2(f"{ckpt_dir}/{f}", f"{checkpoints_dir}/{f}")

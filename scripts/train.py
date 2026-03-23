@@ -315,6 +315,7 @@ def train_texture_generator(args):
         wandb.init(project="piano-accomp", name=f"texture-{time.strftime('%m%d-%H%M')}")
 
     best_val_ppl = float("inf")
+    tex_patience = 0
     ckpt_dir = Path("checkpoints")
     ckpt_dir.mkdir(exist_ok=True)
 
@@ -408,7 +409,13 @@ def train_texture_generator(args):
 
         if val_ppl < best_val_ppl:
             best_val_ppl = val_ppl
+            tex_patience = 0
             torch.save(model.state_dict(), ckpt_dir / "texture_best.pt")
+        else:
+            tex_patience += 1
+            if tex_patience >= 5:
+                print(f"  Early stopping at epoch {epoch+1}")
+                break
 
         if (epoch + 1) % 5 == 0:
             torch.save(model.state_dict(), ckpt_dir / f"texture_epoch{epoch+1}.pt")
